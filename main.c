@@ -480,7 +480,7 @@ static void DrawCupcake(Vector2 base, float s) {
 
 // ================================================================ background and header
 static unsigned int Hash2(int a, int b) {
-    unsigned int h = (unsigned int)(a * 73856093) ^ (unsigned int)(b * 19349663);
+    unsigned int h = ((unsigned int)a * 73856093u) ^ ((unsigned int)b * 19349663u);
     h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
     return h;
 }
@@ -1987,7 +1987,6 @@ static void FrameUpdate(void) {
 }
 
 int main(void) {
-    SetConfigFlags(FLAG_MSAA_4X_HINT);
     InitWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "C Quest");
     SetTargetFPS(60);
     InitApp();
