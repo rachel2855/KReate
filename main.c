@@ -1,4 +1,4 @@
-// C QUEST - a candy-coloured learning app for C basics. Plain C + raylib only.
+// C QUEST - a retro cyberpunk learning app for C basics. Plain C + raylib only.
 // Build (w64devkit, raylib 5.5):
 //   gcc main.c -o cquest.exe -I<raylib>/include -L<raylib>/lib -lraylib -lopengl32 -lgdi32 -lwinmm
 // Two modes: MCQ (pick the answer) and TYPED (type answers, then a stretch
@@ -23,7 +23,7 @@
 #define MAX_BANK 64
 #define MAX_PARTICLES 320
 #define MAX_FLOATS 8
-#define BG_CANDY_COUNT 14
+#define BG_CANDY_COUNT 20
 #define SPARKLE_COUNT 36
 #define PROGRESS_FILE "cquest_progress.dat"
 #ifdef _WIN32
@@ -34,21 +34,24 @@
 #define ATTEMPT_RUN_COMMAND "./cquest_attempt"
 #endif
 
-#define COLOR_BG_TOP  ((Color){104, 58, 214, 255})
-#define COLOR_BG_BOT  ((Color){255, 128, 196, 255})
-#define COLOR_PANEL   ((Color){44, 30, 92, 255})
-#define COLOR_CREAM   ((Color){255, 247, 252, 255})
-#define COLOR_INK     ((Color){58, 22, 98, 255})
-#define COLOR_YELLOW  ((Color){255, 214, 64, 255})
-#define COLOR_PINK    ((Color){255, 92, 168, 255})
-#define COLOR_CYAN    ((Color){72, 224, 255, 255})
-#define COLOR_GREEN   ((Color){96, 232, 120, 255})
-#define COLOR_RED     ((Color){255, 84, 84, 255})
-#define COLOR_ORANGE  ((Color){255, 150, 56, 255})
-#define COLOR_PURPLE  ((Color){164, 104, 255, 255})
-#define COLOR_TEXT    ((Color){240, 240, 255, 255})
-#define COLOR_GRAY    ((Color){176, 164, 200, 255})
-#define COLOR_CODE_BG ((Color){38, 24, 84, 255})
+#define COLOR_BG_TOP  ((Color){4, 2, 22, 255})
+#define COLOR_BG_BOT  ((Color){36, 8, 72, 255})
+#define COLOR_PANEL   ((Color){20, 16, 52, 255})
+#define COLOR_CREAM   ((Color){16, 14, 46, 255})      // dark card fill
+#define COLOR_INK     ((Color){2, 2, 14, 255})        // outlines and shadows
+#define COLOR_YELLOW  ((Color){255, 225, 40, 255})
+#define COLOR_PINK    ((Color){255, 70, 140, 255})
+#define COLOR_CYAN    ((Color){0, 238, 255, 255})
+#define COLOR_GREEN   ((Color){57, 255, 120, 255})
+#define COLOR_RED     ((Color){255, 60, 70, 255})
+#define COLOR_ORANGE  ((Color){255, 128, 24, 255})
+#define COLOR_PURPLE  ((Color){170, 96, 255, 255})
+#define COLOR_TEXT    ((Color){200, 245, 255, 255})
+#define COLOR_TXT     ((Color){205, 244, 255, 255})   // body text on dark cards
+#define COLOR_DIM     ((Color){140, 160, 210, 255})
+#define COLOR_NEON    ((Color){0, 220, 255, 255})
+#define COLOR_GRAY    ((Color){120, 130, 170, 255})
+#define COLOR_CODE_BG ((Color){8, 10, 34, 255})
 
 typedef enum { SCREEN_TITLE, SCREEN_MODE, SCREEN_MAP, SCREEN_QUESTION, SCREEN_RESULTS, SCREEN_REVIEW } ScreenState;
 typedef enum { MODE_MCQ, MODE_TYPED, MODE_COUNT } QuizMode;
@@ -106,6 +109,8 @@ typedef struct {
     int reviewTab, reviewExpanded, reviewCount, reviewIds[MAX_BANK];
     QStatus reviewStatus[MAX_BANK];
     float reviewScroll;
+    float introTime, qTime, hopTime, unlockTime, popupTime;
+    int pendingHop, hopFrom, hopTo, unlockLevel, autoOpenLevel;
     char toast[96];
     float toastTime;
     Progress progress;
@@ -217,12 +222,12 @@ static Vector2 V2(float x, float y) { return (Vector2){ x, y }; }
 static Rectangle Expand(Rectangle r, float a) { return (Rectangle){ r.x - a, r.y - a, r.width + 2 * a, r.height + 2 * a }; }
 static Color CandyColor(int i) {
     switch (((i % 6) + 6) % 6) {
-        case 0: return COLOR_PINK;   case 1: return COLOR_CYAN;   case 2: return COLOR_GREEN;
-        case 3: return COLOR_YELLOW; case 4: return COLOR_ORANGE; default: return COLOR_PURPLE;
+        case 0: return COLOR_CYAN;   case 1: return COLOR_GREEN;  case 2: return COLOR_YELLOW;
+        case 3: return COLOR_ORANGE; case 4: return COLOR_PURPLE; default: return COLOR_PINK;
     }
 }
 static Color LevelColor(int level) {
-    switch (level) { case 0: return COLOR_PINK; case 1: return COLOR_CYAN; case 2: return COLOR_GREEN; case 3: return COLOR_ORANGE; default: return COLOR_PURPLE; }
+    switch (level) { case 0: return COLOR_CYAN; case 1: return COLOR_GREEN; case 2: return COLOR_YELLOW; case 3: return COLOR_ORANGE; default: return COLOR_PURPLE; }
 }
 static const Question *QuestionAt(int bankIndex) { return &questionBank[bankIndex]; }
 
@@ -325,13 +330,46 @@ static void DrawTriSafe(Vector2 a, Vector2 b, Vector2 c, Color col) {
     if (cross > 0) DrawTriangle(a, c, b, col); else DrawTriangle(a, b, c, col);
 }
 
-static void DrawRound(Rectangle r, float radius, Color c) {
-    float m = r.width < r.height ? r.width : r.height;
-    float roundness = Clampf(radius * 2 / m, 0, 1);
-    DrawRectangleRounded(r, roundness, 10, c);
+static void DrawNgon(Vector2 c, int sides, float r, float rotDeg, Color col) {
+    for (int i = 0; i < sides; i++) {
+        float a0 = (rotDeg + 360.0f * i / sides) * DEG2RAD, a1 = (rotDeg + 360.0f * (i + 1) / sides) * DEG2RAD;
+        DrawTriSafe(c, V2(c.x + cosf(a0) * r, c.y + sinf(a0) * r), V2(c.x + cosf(a1) * r, c.y + sinf(a1) * r), col);
+    }
 }
+static void DrawNgonLines(Vector2 c, int sides, float r, float rotDeg, float thick, Color col) {
+    for (int i = 0; i < sides; i++) {
+        float a0 = (rotDeg + 360.0f * i / sides) * DEG2RAD, a1 = (rotDeg + 360.0f * (i + 1) / sides) * DEG2RAD;
+        DrawLineEx(V2(c.x + cosf(a0) * r, c.y + sinf(a0) * r), V2(c.x + cosf(a1) * r, c.y + sinf(a1) * r), thick, col);
+    }
+}
+
+// Cut-corner (chamfered) rectangle: the "retro terminal" panel shape used everywhere.
+static void DrawChamfer(Rectangle r, float cut, Color c) {
+    float m = r.width < r.height ? r.width : r.height;
+    if (cut > m / 2) cut = m / 2;
+    if (cut < 0) cut = 0;
+    DrawRectangleRec((Rectangle){ r.x + cut, r.y, r.width - 2 * cut, r.height }, c);
+    DrawRectangleRec((Rectangle){ r.x, r.y + cut, cut, r.height - 2 * cut }, c);
+    DrawRectangleRec((Rectangle){ r.x + r.width - cut, r.y + cut, cut, r.height - 2 * cut }, c);
+    if (cut <= 0) return;
+    float x2 = r.x + r.width, y2 = r.y + r.height;
+    DrawTriSafe(V2(r.x + cut, r.y), V2(r.x, r.y + cut), V2(r.x + cut, r.y + cut), c);
+    DrawTriSafe(V2(x2 - cut, r.y), V2(x2, r.y + cut), V2(x2 - cut, r.y + cut), c);
+    DrawTriSafe(V2(r.x + cut, y2), V2(r.x, y2 - cut), V2(r.x + cut, y2 - cut), c);
+    DrawTriSafe(V2(x2 - cut, y2), V2(x2, y2 - cut), V2(x2 - cut, y2 - cut), c);
+}
+static void DrawRound(Rectangle r, float radius, Color c) { DrawChamfer(r, radius * 0.5f, c); }
+// Dark panels get a glowing neon edge; bright shapes keep a dark outline.
 static void DrawRoundOutlined(Rectangle r, float radius, float border, Color fill, Color outline) {
-    DrawRound(Expand(r, border), radius + border, outline);
+    bool inkOutline = outline.r == COLOR_INK.r && outline.g == COLOR_INK.g && outline.b == COLOR_INK.b;
+    bool darkFill = (fill.r * 3 + fill.g * 6 + fill.b) / 10 < 90;
+    Color edge = outline;
+    if (inkOutline && darkFill) {
+        edge = COLOR_NEON;
+        DrawRound(Expand(r, border + 5), radius + 5, Fade(edge, 0.07f));
+        DrawRound(Expand(r, border + 2.5f), radius + 2.5f, Fade(edge, 0.14f));
+    }
+    DrawRound(Expand(r, border), radius + border, edge);
     DrawRound(r, radius, fill);
 }
 
@@ -359,7 +397,7 @@ static void DrawBigStar(Vector2 c, float r, bool earned, float pop) {
     r *= EaseOutBack(pop);
     if (!earned) {
         DrawStarShape(c, r * 1.22f, 0, COLOR_INK);
-        DrawStarShape(c, r, 0, (Color){120, 84, 170, 255});
+        DrawStarShape(c, r, 0, (Color){52, 58, 104, 255});
         return;
     }
     DrawStarShape(c, r * 1.22f, 0, COLOR_INK);
@@ -377,105 +415,144 @@ static void DrawStarRow(float cx, float cy, float r, int earned, float revealTim
     }
 }
 
+// Floating holo data-strips.
 static void DrawCloud(Vector2 c, float s, Color col) {
-    DrawCircleV(V2(c.x - 26 * s, c.y + 4 * s), 18 * s, col);
-    DrawCircleV(V2(c.x, c.y - 6 * s), 26 * s, col);
-    DrawCircleV(V2(c.x + 28 * s, c.y + 4 * s), 20 * s, col);
-    DrawRound((Rectangle){ c.x - 44 * s, c.y + 4 * s, 90 * s, 20 * s }, 10 * s, col);
+    Color neon = Fade(COLOR_CYAN, col.a / 255.0f * 0.75f);
+    float widths[3] = { 96, 62, 80 };
+    for (int i = 0; i < 3; i++) {
+        float x = c.x - widths[i] * s / 2 + (i == 1 ? 14 * s : 0), y = c.y + (i - 1) * 13 * s;
+        DrawRectangleRec((Rectangle){ x, y, widths[i] * s, 4 * s }, neon);
+        DrawRectangleRec((Rectangle){ x - 12 * s, y, 6 * s, 4 * s }, neon);
+        DrawRectangleRec((Rectangle){ x + widths[i] * s + 8 * s, y, 3 * s, 4 * s }, neon);
+    }
 }
 
+// Neon beacon pylon: a pole topped with a pulsing hexagon core.
 static void DrawLollipop(Vector2 c, float r, Color a, Color b, float tilt) {
-    Vector2 end = V2(c.x + sinf(tilt) * r * 3.2f, c.y + cosf(tilt) * r * 3.2f);
-    DrawLineEx(c, end, r * 0.34f + 6, COLOR_INK);
-    DrawLineEx(c, end, r * 0.34f, COLOR_CREAM);
-    DrawCircleV(c, r + 3, COLOR_INK);
-    DrawCircleV(c, r, a);
-    DrawRing(c, r * 0.12f, r * 0.4f, 0, 280, 24, b);
-    DrawRing(c, r * 0.62f, r * 0.88f, 100, 380, 32, b);
-    DrawCircleV(V2(c.x - r * 0.4f, c.y - r * 0.45f), r * 0.16f, Fade(WHITE, 0.75f));
+    (void)tilt; (void)b;
+    float t = (float)GetTime();
+    Vector2 end = V2(c.x, c.y + r * 3.2f);
+    DrawLineEx(c, end, 8, COLOR_INK);
+    DrawLineEx(c, end, 4, ColorBrightness(a, -0.5f));
+    DrawRectangle((int)(c.x - 10), (int)(end.y - 4), 20, 6, ColorBrightness(a, -0.6f));
+    DrawNgon(c, 6, r * 1.45f, 0, Fade(a, 0.14f + 0.1f * sinf(t * 3 + r)));
+    DrawNgon(c, 6, r + 3, 0, COLOR_INK);
+    DrawNgon(c, 6, r, 0, a);
+    DrawNgon(c, 6, r * 0.66f, 0, COLOR_INK);
+    DrawNgon(c, 6, r * 0.4f, 0, Fade(a, 0.55f + 0.45f * sinf(t * 4 + r)));
 }
 
+// Spinning data cube.
 static void DrawWrappedCandy(Vector2 c, float r, Color col, float rot) {
-    Vector2 dir = V2(cosf(rot), sinf(rot)), perp = V2(-dir.y, dir.x);
-    Color wrap = ColorBrightness(col, 0.4f);
-    for (int side = -1; side <= 1; side += 2) {
-        Vector2 p0 = V2(c.x + dir.x * side * r * 0.7f, c.y + dir.y * side * r * 0.7f);
-        Vector2 p1 = V2(c.x + dir.x * side * r * 1.9f + perp.x * r * 0.95f, c.y + dir.y * side * r * 1.9f + perp.y * r * 0.95f);
-        Vector2 p2 = V2(c.x + dir.x * side * r * 1.9f - perp.x * r * 0.95f, c.y + dir.y * side * r * 1.9f - perp.y * r * 0.95f);
-        DrawTriSafe(V2(p0.x + (p0.x - c.x) * 0.0f, p0.y), V2(p1.x + (p1.x - c.x) * 0.12f, p1.y + (p1.y - c.y) * 0.12f), V2(p2.x + (p2.x - c.x) * 0.12f, p2.y + (p2.y - c.y) * 0.12f), COLOR_INK);
-        DrawTriSafe(p0, p1, p2, wrap);
-    }
-    DrawCircleV(c, r + 3, COLOR_INK);
-    DrawCircleV(c, r, col);
-    DrawRing(c, r * 0.5f, r * 0.72f, 200, 330, 16, ColorBrightness(col, 0.45f));
-    DrawCircleV(V2(c.x - r * 0.35f, c.y - r * 0.4f), r * 0.17f, Fade(WHITE, 0.8f));
+    float deg = rot * RAD2DEG;
+    DrawNgon(c, 4, r * 1.9f, deg, Fade(col, 0.15f));
+    DrawNgon(c, 4, r * 1.5f + 3, deg, COLOR_INK);
+    DrawNgon(c, 4, r * 1.5f, deg, col);
+    DrawNgon(c, 4, r * 1.05f, deg, COLOR_INK);
+    DrawNgon(c, 4, r * 0.45f, deg + 45, col);
 }
 
+// Energy cell: a glowing tube.
 static void DrawBean(Vector2 c, float length, float thick, Color col, float rot) {
-    Vector2 dir = V2(cosf(rot), sinf(rot)), perp = V2(-dir.y, dir.x);
+    Vector2 dir = V2(cosf(rot), sinf(rot));
     Vector2 a = V2(c.x - dir.x * length / 2, c.y - dir.y * length / 2), b = V2(c.x + dir.x * length / 2, c.y + dir.y * length / 2);
-    DrawLineEx(a, b, thick + 6, COLOR_INK);
-    DrawCircleV(a, thick / 2 + 3, COLOR_INK);
-    DrawCircleV(b, thick / 2 + 3, COLOR_INK);
-    DrawLineEx(a, b, thick, col);
-    DrawCircleV(a, thick / 2, col);
-    DrawCircleV(b, thick / 2, col);
-    Vector2 h0 = V2(a.x + perp.x * thick * -0.2f + dir.x * thick * 0.2f, a.y + perp.y * thick * -0.2f + dir.y * thick * 0.2f);
-    Vector2 h1 = V2(c.x + perp.x * thick * -0.2f, c.y + perp.y * thick * -0.2f);
-    DrawLineEx(h0, h1, thick * 0.2f, Fade(WHITE, 0.6f));
+    DrawLineEx(a, b, thick + 12, Fade(col, 0.16f));
+    DrawLineEx(a, b, thick + 5, COLOR_INK);
+    DrawLineEx(a, b, thick * 0.55f, col);
+    DrawLineEx(a, b, thick * 0.18f, Fade(WHITE, 0.8f));
 }
 
+// Blinking server tower. (base = bottom centre)
 static void DrawCupcake(Vector2 base, float s) {
-    Vector2 tl = V2(base.x - 22 * s, base.y - 24 * s), tr = V2(base.x + 22 * s, base.y - 24 * s);
-    Vector2 bl = V2(base.x - 15 * s, base.y), br = V2(base.x + 15 * s, base.y);
-    DrawCircleV(V2(base.x, base.y - 50 * s), 24 * s + 3, COLOR_INK);
-    DrawCircleV(V2(base.x, base.y - 36 * s), 25 * s + 3, COLOR_INK);
-    DrawTriSafe(V2(tl.x - 3, tl.y - 2), V2(tr.x + 3, tr.y - 2), V2(br.x + 2, br.y + 3), COLOR_INK);
-    DrawTriSafe(V2(tl.x - 3, tl.y - 2), V2(br.x + 2, br.y + 3), V2(bl.x - 2, bl.y + 3), COLOR_INK);
-    DrawTriSafe(tl, tr, br, COLOR_CYAN);
-    DrawTriSafe(tl, br, bl, COLOR_CYAN);
-    for (int i = -1; i <= 1; i++) DrawLineEx(V2(base.x + i * 11 * s, base.y - 22 * s), V2(base.x + i * 8 * s, base.y - 2 * s), 3 * s, ColorBrightness(COLOR_CYAN, -0.25f));
-    DrawCircleV(V2(base.x, base.y - 34 * s), 25 * s, COLOR_CREAM);
-    DrawCircleV(V2(base.x, base.y - 48 * s), 21 * s, COLOR_PINK);
-    DrawCircleV(V2(base.x - 7 * s, base.y - 54 * s), 4 * s, Fade(WHITE, 0.7f));
-    DrawCircleV(V2(base.x + 2 * s, base.y - 72 * s), 7 * s + 2, COLOR_INK);
-    DrawCircleV(V2(base.x + 2 * s, base.y - 72 * s), 7 * s, COLOR_RED);
-}
-
-static void DrawCandyShape(int type, Vector2 c, float size, Color col, float rot) {
-    switch (type % 5) {
-        case 0: DrawLollipop(c, size, col, COLOR_CREAM, sinf(rot) * 0.3f); break;
-        case 1: DrawWrappedCandy(c, size * 0.8f, col, rot); break;
-        case 2: DrawBean(c, size * 1.8f, size * 0.9f, col, rot); break;
-        case 3: DrawStarShape(c, size * 1.15f, rot, COLOR_YELLOW); break;
-        default: DrawSparkle(c, size * 1.3f, COLOR_CREAM); break;
+    float t = (float)GetTime();
+    Rectangle box = { base.x - 22 * s, base.y - 78 * s, 44 * s, 78 * s };
+    DrawRoundOutlined(box, 8 * s, 2.5f * s, COLOR_CODE_BG, COLOR_INK);
+    for (int i = 0; i < 4; i++) {
+        float y = box.y + 9 * s + i * 17 * s;
+        DrawRectangleRec((Rectangle){ box.x + 6 * s, y, 32 * s, 11 * s }, (Color){24, 28, 70, 255});
+        bool on = ((int)(t * 3 + i * 2) % 3) != 0;
+        DrawRectangleRec((Rectangle){ box.x + 9 * s, y + 3 * s, 5 * s, 5 * s }, on ? CandyColor(i + 1) : (Color){40, 44, 90, 255});
+        DrawRectangleRec((Rectangle){ box.x + 18 * s, y + 4 * s, 16 * s, 3 * s }, Fade(COLOR_CYAN, 0.5f));
     }
 }
+
+
 
 // ================================================================ background and header
+static unsigned int Hash2(int a, int b) {
+    unsigned int h = (unsigned int)(a * 73856093) ^ (unsigned int)(b * 19349663);
+    h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
+    return h;
+}
+
+// Retro-futuristic night city: sun, skyline, data rain and a scrolling neon grid.
 static void DrawBackground(float wash) {
     float t = (float)GetTime();
-    DrawRectangleGradientV(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT, COLOR_BG_TOP, COLOR_BG_BOT);
+    const int horizon = 392;
+    DrawRectangleGradientV(0, 0, WINDOW_WIDTH, horizon + 10, COLOR_BG_TOP, COLOR_BG_BOT);
     for (int i = 0; i < SPARKLE_COUNT; i++) {
         float twinkle = 0.5f + 0.5f * sinf(t * 2.2f + i * 1.7f);
-        DrawSparkle(sparklePos[i], 3 + 5 * twinkle, Fade(WHITE, 0.25f + 0.5f * twinkle));
+        if (sparklePos[i].y < horizon - 20) DrawRectangle((int)sparklePos[i].x, (int)sparklePos[i].y, 2 + (i % 2), 2 + (i % 2), Fade(WHITE, 0.2f + 0.6f * twinkle));
     }
+    // striped sun
+    for (int dy = 0; dy < 130; dy += 3) {
+        int stripe = dy / 3;
+        if (dy < 90 && stripe % 6 == 5) continue;   // stripe gaps in the lower sun
+        float half = sqrtf(130.0f * 130.0f - (float)dy * dy);
+        float f = dy / 130.0f;
+        Color c = { 255, (unsigned char)(70 + 150 * f), (unsigned char)(10 + 20 * f), 255 };
+        DrawRectangle((int)(500 - half), horizon - dy - 3, (int)(half * 2), 3, Fade(c, 0.9f));
+    }
+    // falling data rain
+    static const char glyphs[] = "01{}();<>=+*#%&/\\";
     for (int i = 0; i < BG_CANDY_COUNT; i++) {
-        float speed = 10 + (i * 7) % 15;
-        float x = 40 + (i * 977 % 920) + sinf(t * 0.7f + i) * 16;
-        float y = WINDOW_HEIGHT + 40 - fmodf(t * speed + i * 83, WINDOW_HEIGHT + 80);
-        DrawCandyShape(i, V2(x, y), 9 + (i * 5) % 9, CandyColor(i), t * 0.8f + i);
+        float x = 12 + i * 52 + (Hash2(i, 1) % 20);
+        float speed = 50 + (Hash2(i, 2) % 70);
+        float head = fmodf(t * speed + (Hash2(i, 3) % 600), WINDOW_HEIGHT + 240) - 120;
+        for (int k = 0; k < 9; k++) {
+            float y = head - k * 17;
+            if (y < -20 || y > horizon - 4) continue;
+            char one[2] = { glyphs[(Hash2(i * 31 + k, (int)(t * 3)) % (sizeof glyphs - 1))], 0 };
+            if (k > 0 && (int)(t * 3 + k * 5 + i) % 7 != 0) one[0] = glyphs[(Hash2(i, k) % (sizeof glyphs - 1))];
+            DrawText(one, (int)x, (int)y, 16, k == 0 ? Fade(WHITE, 0.6f) : Fade(COLOR_GREEN, 0.28f * (1.0f - k / 9.0f)));
+        }
     }
-    if (wash > 0) DrawRectangle(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT, Fade((Color){150, 90, 220, 255}, wash));
+    // skyline
+    for (int i = 0; i < 28; i++) {
+        unsigned int h = Hash2(i, 7);
+        int w = 30 + (int)(h % 26), height = 40 + (int)((h >> 5) % 100), x = i * 37 - 10;
+        Rectangle b = { (float)x, (float)(horizon - height), (float)w, (float)height + 4 };
+        DrawRectangleRec(b, (Color){10, 8, 36, 255});
+        DrawRectangle(x, horizon - height, w, 2, Fade(COLOR_CYAN, 0.35f));
+        if (h % 5 == 0) { DrawRectangle(x + w / 2, horizon - height - 16, 2, 16, (Color){10, 8, 36, 255}); DrawRectangle(x + w / 2 - 1, horizon - height - 18, 4, 4, ((int)(t * 2) % 2) ? COLOR_RED : Fade(COLOR_RED, 0.2f)); }
+        for (int wy = 8; wy < height - 4; wy += 9)
+            for (int wx = 5; wx < w - 5; wx += 8) {
+                unsigned int wh = Hash2(i * 100 + wy, wx + (int)(t * 0.4f * ((wy + wx) % 3 == 0)));
+                if (wh % 4 == 0) DrawRectangle(x + wx, horizon - height + wy, 3, 4, wh % 3 == 0 ? Fade(COLOR_YELLOW, 0.8f) : Fade(COLOR_CYAN, 0.7f));
+            }
+    }
+    // neon grid floor
+    DrawRectangleGradientV(0, horizon, WINDOW_WIDTH, WINDOW_HEIGHT - horizon, (Color){46, 10, 96, 255}, (Color){6, 4, 30, 255});
+    DrawRectangle(0, horizon - 1, WINDOW_WIDTH, 3, COLOR_CYAN);
+    DrawRectangle(0, horizon + 2, WINDOW_WIDTH, 8, Fade(COLOR_CYAN, 0.18f));
+    float phase = fmodf(t * 0.5f, 1.0f);
+    for (int k = 0; k < 12; k++) {
+        float z = (k + phase) / 12.0f;
+        int y = horizon + (int)((WINDOW_HEIGHT - horizon) * z * z);
+        DrawRectangle(0, y, WINDOW_WIDTH, 2, Fade(COLOR_PURPLE, 0.15f + 0.6f * z));
+    }
+    for (int i = -16; i <= 16; i++)
+        DrawLineEx(V2(500 + i * 12.0f, (float)horizon), V2(500 + i * 120.0f, (float)WINDOW_HEIGHT), 2, Fade(COLOR_PURPLE, 0.45f));
+    if (wash > 0) DrawRectangle(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT, Fade((Color){2, 2, 18, 255}, Clampf(wash * 2.4f, 0, 0.85f)));
 }
 
 static void DrawStatChip(Rectangle r, bool star, int value) {
-    DrawRoundOutlined(r, r.height / 2, 3, (Color){255, 255, 255, 235}, COLOR_INK);
+    DrawRoundOutlined(r, r.height / 2, 3, COLOR_CREAM, COLOR_INK);
     if (star) DrawStarShape(V2(r.x + 20, r.y + r.height / 2), 11, 0, COLOR_YELLOW);
-    else DrawCircleV(V2(r.x + 20, r.y + r.height / 2), 10, COLOR_CYAN);
+    else DrawNgon(V2(r.x + 20, r.y + r.height / 2), 6, 10, 0, COLOR_CYAN);
     char text[24];
     snprintf(text, sizeof text, star ? "%d" : "%d XP", value);
-    DrawText(text, (int)r.x + 38, (int)(r.y + r.height / 2) - 10, 20, COLOR_INK);
+    DrawText(text, (int)r.x + 38, (int)(r.y + r.height / 2) - 10, 20, COLOR_TXT);
 }
 
 static int TotalStars(void) {
@@ -485,18 +562,19 @@ static int TotalStars(void) {
 }
 
 // Purple bar with cream icing dripping off the bottom edge.
+// HUD bar with a neon underline and a glitchy chromatic title.
 static void DrawHeaderBar(const char *title, int titleX, bool chips) {
-    DrawRectangleGradientV(0, 0, WINDOW_WIDTH, 58, (Color){138, 78, 236, 255}, (Color){104, 54, 200, 255});
-    DrawRectangle(0, 0, WINDOW_WIDTH, 3, Fade(WHITE, 0.4f));
-    DrawRectangle(0, 56, WINDOW_WIDTH, 3, Fade(COLOR_INK, 0.45f));
-    DrawRectangle(0, 58, WINDOW_WIDTH, 9, COLOR_CREAM);
-    for (int i = 0; i < 27; i++) {
-        float x = i * 38.0f + 6;
-        float length = 10 + (i * 37 % 19);
-        DrawRound((Rectangle){ x, 58, 24, length + 9 }, 12, COLOR_CREAM);
-        DrawCircleV(V2(x + 6, 62), 2, Fade(COLOR_PINK, 0.35f));
+    DrawRectangleGradientV(0, 0, WINDOW_WIDTH, 60, (Color){8, 8, 38, 255}, (Color){22, 16, 70, 255});
+    DrawRectangle(0, 0, WINDOW_WIDTH, 2, Fade(COLOR_PURPLE, 0.9f));
+    for (int i = 0; i < WINDOW_WIDTH; i += 16) DrawRectangle(i, 50, 2, (i / 16) % 4 == 0 ? 8 : 4, Fade(COLOR_CYAN, 0.3f));
+    DrawRectangle(0, 58, WINDOW_WIDTH, 3, COLOR_CYAN);
+    DrawRectangle(0, 61, WINDOW_WIDTH, 7, Fade(COLOR_CYAN, 0.16f));
+    if (title) {
+        float glitch = (fmodf((float)GetTime(), 4.0f) < 0.12f) ? 5.0f : 2.0f;
+        DrawText(title, titleX - (int)glitch, 14, 30, Fade(COLOR_CYAN, 0.9f));
+        DrawText(title, titleX + (int)glitch, 16, 30, Fade(COLOR_PURPLE, 0.9f));
+        DrawText(title, titleX, 15, 30, WHITE);
     }
-    if (title) DrawTextO(title, titleX, 14, 30, WHITE, COLOR_INK);
     if (chips) {
         DrawStatChip((Rectangle){ 700, 11, 120, 36 }, true, TotalStars());
         DrawStatChip((Rectangle){ 835, 11, 140, 36 }, false, app.progress.totalXp);
@@ -509,15 +587,15 @@ static void DrawBot(float cx, float footY, float s, BotMood mood) {
     float bob = sinf(t * 3.0f) * 2.5f * s;
     if (mood == MOOD_CHEER) bob = -fabsf(sinf(t * 7.0f)) * 12.0f * s;
     if (mood == MOOD_SAD) bob = sinf(t * 1.6f) * 1.0f * s;
-    Color white = { 248, 250, 255, 255 }, shade = { 202, 212, 240, 255 };
+    Color white = { 222, 232, 252, 255 }, shade = { 150, 168, 214, 255 };
     Color headCol = { 170, 238, 255, 255 }, glow = { 126, 255, 250, 255 };
     float y0 = footY + bob;
 
-    DrawEllipse((int)cx, (int)footY, 38 * s * (1.0f + bob / (60 * s)), 7 * s, Fade(COLOR_INK, 0.28f));
+    DrawEllipse((int)cx, (int)footY, 38 * s * (1.0f + bob / (60 * s)), 7 * s, Fade(COLOR_CYAN, 0.30f));
 
     // feet
-    DrawRoundOutlined((Rectangle){ cx - 27 * s, y0 - 12 * s, 23 * s, 12 * s }, 5 * s, 2.5f * s, COLOR_PINK, COLOR_INK);
-    DrawRoundOutlined((Rectangle){ cx + 4 * s, y0 - 12 * s, 23 * s, 12 * s }, 5 * s, 2.5f * s, COLOR_PINK, COLOR_INK);
+    DrawRoundOutlined((Rectangle){ cx - 27 * s, y0 - 12 * s, 23 * s, 12 * s }, 5 * s, 2.5f * s, COLOR_ORANGE, COLOR_INK);
+    DrawRoundOutlined((Rectangle){ cx + 4 * s, y0 - 12 * s, 23 * s, 12 * s }, 5 * s, 2.5f * s, COLOR_ORANGE, COLOR_INK);
 
     // arms (angles in degrees, 90 = straight down)
     float shoulderY = y0 - 40 * s;
@@ -544,7 +622,7 @@ static void DrawBot(float cx, float footY, float s, BotMood mood) {
     DrawRoundOutlined(panel, 7 * s, 2 * s, COLOR_CODE_BG, COLOR_INK);
     float beat = 1.0f + 0.16f * sinf(t * 6.0f);
     float hy = panel.y + panel.height / 2 - 1 * s;
-    Color heartCol = mood == MOOD_SAD ? (Color){110, 150, 255, 255} : COLOR_PINK;
+    Color heartCol = mood == MOOD_SAD ? (Color){110, 150, 255, 255} : COLOR_RED;
     DrawCircleV(V2(cx - 4.2f * s * beat, hy - 2 * s), 4.6f * s * beat, heartCol);
     DrawCircleV(V2(cx + 4.2f * s * beat, hy - 2 * s), 4.6f * s * beat, heartCol);
     DrawTriSafe(V2(cx - 8.6f * s * beat, hy - 0.2f * s), V2(cx + 8.6f * s * beat, hy - 0.2f * s), V2(cx, hy + 8.5f * s * beat), heartCol);
@@ -564,8 +642,8 @@ static void DrawBot(float cx, float footY, float s, BotMood mood) {
     DrawCircleV(V2(antTop.x - 2 * s, antTop.y - 2 * s), 2 * s, Fade(WHITE, 0.9f));
     DrawCircleV(V2(cx - 44 * s, headTop + 30 * s), 11 * s, COLOR_INK);
     DrawCircleV(V2(cx + 44 * s, headTop + 30 * s), 11 * s, COLOR_INK);
-    DrawCircleV(V2(cx - 44 * s, headTop + 30 * s), 8.5f * s, COLOR_PINK);
-    DrawCircleV(V2(cx + 44 * s, headTop + 30 * s), 8.5f * s, COLOR_PINK);
+    DrawCircleV(V2(cx - 44 * s, headTop + 30 * s), 8.5f * s, COLOR_ORANGE);
+    DrawCircleV(V2(cx + 44 * s, headTop + 30 * s), 8.5f * s, COLOR_ORANGE);
     DrawRoundOutlined(head, 21 * s, 3 * s, headCol, COLOR_INK);
     DrawRound((Rectangle){ head.x + 9 * s, head.y + 4 * s, 28 * s, 5 * s }, 2.5f * s, Fade(WHITE, 0.7f));
 
@@ -597,10 +675,10 @@ static void DrawBot(float cx, float footY, float s, BotMood mood) {
         float drop = fmodf(t * 14.0f, 20.0f);
         DrawCircleV(V2(eyeX[1] + 4 * s, eyeY + (10 + drop) * s), 2.8f * s, (Color){120, 200, 255, 255});
     }
-    DrawEllipse((int)(cx - 28 * s), (int)(eyeY + 14 * s), 5.5f * s, 3.2f * s, Fade(COLOR_PINK, 0.85f));
-    DrawEllipse((int)(cx + 28 * s), (int)(eyeY + 14 * s), 5.5f * s, 3.2f * s, Fade(COLOR_PINK, 0.85f));
+    DrawEllipse((int)(cx - 28 * s), (int)(eyeY + 14 * s), 5.5f * s, 3.2f * s, Fade(COLOR_ORANGE, 0.85f));
+    DrawEllipse((int)(cx + 28 * s), (int)(eyeY + 14 * s), 5.5f * s, 3.2f * s, Fade(COLOR_ORANGE, 0.85f));
     Vector2 mouth = V2(cx, eyeY + 17 * s);
-    if (mood == MOOD_CHEER) DrawCircleSector(V2(mouth.x, mouth.y - 4 * s), 8 * s, 0, 180, 18, COLOR_PINK);
+    if (mood == MOOD_CHEER) DrawCircleSector(V2(mouth.x, mouth.y - 4 * s), 8 * s, 0, 180, 18, COLOR_ORANGE);
     else if (mood == MOOD_SAD) DrawRing(V2(mouth.x, mouth.y + 5 * s), 4.0f * s, 6.2f * s, 205, 335, 14, glow);
     else if (mood == MOOD_THINK) DrawRing(mouth, 1.8f * s, 4.0f * s, 0, 360, 14, glow);
     else DrawRing(V2(mouth.x, mouth.y - 5 * s), 4.0f * s, 6.4f * s, 25, 155, 14, glow);
@@ -614,10 +692,11 @@ static void DrawBot(float cx, float footY, float s, BotMood mood) {
 
 static void DrawBubble(Rectangle r, const char *text, int fontSize, float tailX) {
     float bottom = r.y + r.height;
-    DrawTriSafe(V2(tailX - 14, bottom - 2), V2(tailX + 14, bottom - 2), V2(tailX + 2, bottom + 22), COLOR_INK);
+    DrawTriSafe(V2(tailX - 14, bottom - 2), V2(tailX + 14, bottom - 2), V2(tailX + 2, bottom + 22), COLOR_NEON);
     DrawRoundOutlined(r, 14, 3, COLOR_CREAM, COLOR_INK);
     DrawTriSafe(V2(tailX - 10, bottom - 2), V2(tailX + 10, bottom - 2), V2(tailX + 2, bottom + 14), COLOR_CREAM);
-    WrapText(text, (int)r.x + 12, (int)r.y + 10, (int)r.width - 24, fontSize, COLOR_INK, true);
+    DrawRectangle((int)tailX - 10, (int)bottom - 3, 20, 4, COLOR_CREAM);
+    WrapText(text, (int)r.x + 12, (int)r.y + 10, (int)r.width - 24, fontSize, COLOR_TXT, true);
 }
 
 // ================================================================ particles and floating text
@@ -669,31 +748,34 @@ static void DrawEffects(void) {
         Rectangle r = { (WINDOW_WIDTH - w) / 2.0f, 520, (float)w, 46 };
         float a = Clampf(app.toastTime / 0.4f, 0, 1);
         DrawRoundOutlined(r, 23, 3, Fade(COLOR_CREAM, a), Fade(COLOR_INK, a));
-        DrawText(app.toast, (int)r.x + 25, (int)r.y + 12, 22, Fade(COLOR_INK, a));
+        DrawText(app.toast, (int)r.x + 25, (int)r.y + 12, 22, Fade(COLOR_TXT, a));
     }
 }
 
 // ================================================================ candy button
 // Glossy button with a chunky 3D base. Returns true when clicked.
+static Color Mix(Color c, float f) { return (Color){ (unsigned char)(c.r * f), (unsigned char)(c.g * f), (unsigned char)(c.b * f), 255 }; }
+
+// Arcade-style neon button: dark glass face, glowing edge, chunky base. Returns true when clicked.
 static bool DrawCandyButton(Rectangle bounds, const char *label, Color fill, bool enabled, int fontSize) {
     bool hovered = enabled && HoverRect(bounds);
     bool down = hovered && IsMouseButtonDown(MOUSE_BUTTON_LEFT);
     float depth = 7;
-    float faceShift = down ? depth - 2 : (hovered ? -2 : 0);
-    Color face = enabled ? fill : COLOR_GRAY;
-    if (hovered) face = ColorBrightness(face, 0.12f);
-    Rectangle slab = { bounds.x, bounds.y + depth, bounds.width, bounds.height - depth };
+    float faceShift = down ? depth - 2 : 0;
+    Color neon = enabled ? fill : (Color){84, 90, 126, 255};
+    Rectangle slab = { bounds.x + 2, bounds.y + depth, bounds.width, bounds.height - depth };
     Rectangle top = { bounds.x, bounds.y + faceShift, bounds.width, bounds.height - depth };
-    float radius = top.height / 2;
-    DrawRound((Rectangle){ slab.x - 1, slab.y + 5, slab.width + 2, slab.height }, radius, Fade(BLACK, 0.22f));
-    DrawRound(Expand(slab, 3), radius + 3, COLOR_INK);
-    DrawRound(slab, radius, ColorBrightness(face, -0.38f));
-    DrawRound(Expand(top, 3), radius + 3, COLOR_INK);
-    DrawRound(top, radius, face);
-    DrawRound((Rectangle){ top.x + top.height * 0.45f, top.y + 4, top.width - top.height * 0.9f, top.height * 0.34f }, top.height * 0.17f, Fade(WHITE, enabled ? 0.38f : 0.2f));
+    float cut = top.height * 0.3f;
+    DrawChamfer(slab, cut, Mix(neon, 0.38f));
+    if (hovered) DrawChamfer(Expand(top, 7), cut + 4, Fade(neon, 0.22f));
+    DrawChamfer(Expand(top, 1), cut, COLOR_INK);
+    DrawChamfer(top, cut, neon);
+    DrawChamfer(Expand(top, -3), cut - 1.5f, enabled ? Mix(neon, hovered ? 0.5f : 0.17f) : (Color){22, 22, 44, 255});
+    DrawRectangle((int)(top.x + cut + 4), (int)top.y + 5, (int)(top.width - 2 * cut - 8), 2, Fade(WHITE, enabled ? 0.28f : 0.1f));
     if (label[0]) {
         int tw = MeasureText(label, fontSize);
-        DrawTextO(label, (int)(top.x + top.width / 2) - tw / 2, (int)(top.y + top.height / 2) - fontSize / 2 + 1, fontSize, WHITE, ColorBrightness(face, -0.62f));
+        Color text = enabled ? (hovered ? WHITE : ColorBrightness(neon, 0.35f)) : (Color){110, 116, 150, 255};
+        DrawTextO(label, (int)(top.x + top.width / 2) - tw / 2, (int)(top.y + top.height / 2) - fontSize / 2 + 1, fontSize, text, COLOR_INK);
     }
     return enabled && TakeClick(hovered);
 }
@@ -782,6 +864,8 @@ static void BeginSession(void) {
     app.fixedCount = 0;
     app.confirmQuit = false;
     app.selectedLevel = -1;
+    app.introTime = 2.1f;
+    app.qTime = 0;
     LoadQuestionInputs();
     SetScreen(SCREEN_QUESTION);
 }
@@ -810,6 +894,7 @@ static bool StartPractice(void) {
 
 static void GoToQuestion(int index) {
     app.current = index;
+    app.qTime = 0;
     LoadQuestionInputs();
 }
 
@@ -826,7 +911,9 @@ static void FinishSession(void) {
     app.correctCount = 0;
     for (int i = 0; i < app.questionCount; i++) if (app.qStatus[i] == ST_CORRECT) app.correctCount++;
     app.levelGems = GemsForScore(app.correctCount, app.questionCount);
+    bool nextWasOpen = app.levelIndex >= 0 && app.levelIndex + 1 < LEVEL_COUNT && IsLevelUnlocked(app.mode, app.levelIndex + 1);
     if (app.levelIndex >= 0 && app.levelGems > app.progress.bestGems[app.mode][app.levelIndex]) app.progress.bestGems[app.mode][app.levelIndex] = app.levelGems;
+    if (app.levelIndex >= 0 && app.levelIndex + 1 < LEVEL_COUNT && !nextWasOpen && IsLevelUnlocked(app.mode, app.levelIndex + 1)) app.pendingHop = app.levelIndex;
     app.lastRunCount = app.questionCount;
     for (int i = 0; i < app.questionCount; i++) { app.lastRunIds[i] = app.questionIds[i]; app.lastRunStatus[i] = app.qStatus[i]; }
     SaveProgress();
@@ -1002,13 +1089,10 @@ static bool RunCodeChallenge(const Question *question, char *detail, int detailS
 static void ScreenTitle(void) {
     float t = (float)GetTime();
     DrawBackground(0);
-    DrawEllipse(170, 650, 430, 175, (Color){255, 170, 214, 255});
-    DrawEllipse(830, 660, 470, 160, (Color){255, 146, 200, 255});
-    DrawEllipse(500, 700, 720, 160, (Color){255, 228, 242, 255});
     DrawCloud(V2(170 + sinf(t * 0.3f) * 20, 150), 1.0f, Fade(WHITE, 0.55f));
     DrawCloud(V2(840 + sinf(t * 0.25f) * 24, 190), 1.2f, Fade(WHITE, 0.55f));
-    DrawLollipop(V2(95, 455), 32, COLOR_PINK, COLOR_CREAM, 0.2f);
-    DrawLollipop(V2(905, 440), 36, COLOR_CYAN, COLOR_CREAM, -0.25f);
+    DrawLollipop(V2(95, 455), 32, COLOR_CYAN, COLOR_CREAM, 0.2f);
+    DrawLollipop(V2(905, 440), 36, COLOR_YELLOW, COLOR_CREAM, -0.25f);
     DrawCupcake(V2(215, 612), 0.95f);
     DrawCupcake(V2(790, 616), 0.95f);
     DrawWrappedCandy(V2(120, 330 + sinf(t * 2) * 8), 18, COLOR_YELLOW, t);
@@ -1023,7 +1107,9 @@ static void ScreenTitle(void) {
         int y = 56 + (int)(sinf(t * 3.2f + i * 0.8f) * 9);
         if (logo[i] != ' ') {
             DrawText(one, x, y + 10, size, Fade(COLOR_INK, 0.55f));
-            DrawTextO(one, x, y, size, CandyColor(i), COLOR_INK);
+            DrawText(one, x - 4, y, size, Fade(COLOR_CYAN, 0.65f));
+            DrawText(one, x + 4, y, size, Fade(COLOR_PURPLE, 0.65f));
+            DrawTextO(one, x, y, size, WHITE, COLOR_INK);
         }
         x += MeasureText(one, size) + spacing;
     }
@@ -1032,9 +1118,8 @@ static void ScreenTitle(void) {
     DrawSparkle(V2(838, 60), 9, WHITE);
 
     Rectangle ribbon = { 290, 206, 420, 50 };
-    DrawRoundOutlined(ribbon, 25, 4, COLOR_PINK, COLOR_INK);
-    DrawRound((Rectangle){ ribbon.x + 20, ribbon.y + 5, ribbon.width - 40, 14 }, 7, Fade(WHITE, 0.3f));
-    DrawTextCO("Learn C the sweet way!", WINDOW_WIDTH / 2, 218, 26, WHITE, COLOR_INK);
+    DrawRoundOutlined(ribbon, 25, 4, COLOR_CREAM, COLOR_INK);
+    DrawTextCO("> learn C the retro way", WINDOW_WIDTH / 2, 218, 26, COLOR_GREEN, COLOR_INK);
 
     DrawBot(500, 545, 1.7f, MOOD_HAPPY);
     float pulse = 1.0f + 0.04f * sinf(t * 5);
@@ -1071,13 +1156,13 @@ static void DrawModeCard(Rectangle r, int mode, Color accent) {
     }
     WrapText(mode == MODE_MCQ ? "Pick the right answer from four choices. Press 1-4 or click. Great for warming up."
                               : "Type your answers. Then unlock the Function Lab, where your code is compiled and tested with gcc.",
-             (int)r.x + 26, (int)r.y + 190, (int)r.width - 52, 20, COLOR_INK, true);
+             (int)r.x + 26, (int)r.y + 190, (int)r.width - 52, 20, COLOR_TXT, true);
     int stars = 0, maxStars = 0;
     for (int l = 0; l < LEVEL_COUNT; l++) if (IsLevelAvailable((QuizMode)mode, l)) { stars += app.progress.bestGems[mode][l]; maxStars += 3; }
     DrawStarShape(V2(r.x + 40, r.y + r.height - 38), 14, 0, COLOR_YELLOW);
     char text[40];
     snprintf(text, sizeof text, "%d / %d", stars, maxStars);
-    DrawText(text, (int)r.x + 62, (int)r.y + (int)r.height - 48, 22, COLOR_INK);
+    DrawText(text, (int)r.x + 62, (int)r.y + (int)r.height - 48, 22, COLOR_TXT);
     if (DrawCandyButton((Rectangle){ r.x + r.width - 190, r.y + r.height - 70, 160, 54 }, "PLAY", accent, true, 26) || TakeClick(hovered)) {
         app.mode = (QuizMode)mode;
         SetScreen(SCREEN_MAP);
@@ -1087,11 +1172,11 @@ static void DrawModeCard(Rectangle r, int mode, Color accent) {
 static void ScreenMode(void) {
     DrawBackground(0.15f);
     DrawModeCard((Rectangle){ 60, 104, 410, 340 }, MODE_MCQ, COLOR_GREEN);
-    DrawModeCard((Rectangle){ 530, 104, 410, 340 }, MODE_TYPED, COLOR_PINK);
+    DrawModeCard((Rectangle){ 530, 104, 410, 340 }, MODE_TYPED, COLOR_PURPLE);
     DrawBubble((Rectangle){ 340, 470, 320, 44 }, "How do you want to learn today?", 18, 500);
     DrawBot(500, 628, 0.8f, MOOD_HAPPY);
     DrawHeaderBar("CHOOSE YOUR MODE", 122, true);
-    if (DrawCandyButton((Rectangle){ 12, 8, 100, 44 }, "BACK", COLOR_PINK, true, 20) || IsKeyPressed(KEY_ESCAPE)) SetScreen(SCREEN_TITLE);
+    if (DrawCandyButton((Rectangle){ 12, 8, 100, 44 }, "BACK", COLOR_ORANGE, true, 20) || IsKeyPressed(KEY_ESCAPE)) SetScreen(SCREEN_TITLE);
 }
 
 static void DrawXMark(Rectangle b) {
@@ -1113,38 +1198,47 @@ static int CurrentLevelForMap(void) {
     return last;
 }
 
-static void DrawRoad(void) {
-    for (int pass = 0; pass < 3; pass++) {
-        for (int seg = 0; seg < LEVEL_COUNT - 1; seg++) {
-            bool open = IsLevelUnlocked(app.mode, seg + 1);
-            Vector2 a = nodePos[seg], b = nodePos[seg + 1];
-            for (int i = 0; i <= 30; i++) {
-                float f = i / 30.0f;
-                Vector2 p = V2(a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * Smooth(f));
-                if (pass == 0) DrawCircleV(p, 19, Fade(COLOR_INK, 0.35f));
-                else if (pass == 1) DrawCircleV(p, 15, open ? (Color){255, 238, 176, 255} : (Color){222, 200, 244, 255});
-                else if (i % 3 == 0) DrawCircleV(p, 3.2f, open ? (Color){255, 190, 70, 255} : (Color){190, 160, 224, 255});
-            }
-        }
-    }
+static bool MapUnlocked(int level) { return IsLevelUnlocked(app.mode, level) && app.hopTo != level; }
+static Vector2 RoadPoint(int seg, float f) {
+    Vector2 a = nodePos[seg], b = nodePos[seg + 1];
+    return V2(a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * Smooth(f));
 }
 
+// Glowing data path; energy pulses run along the open stretches.
+static void DrawRoad(void) {
+    int pulse = (int)(GetTime() * 14);
+    for (int pass = 0; pass < 3; pass++)
+        for (int seg = 0; seg < LEVEL_COUNT - 1; seg++) {
+            bool open = MapUnlocked(seg + 1);
+            for (int i = 0; i <= 30; i++) {
+                Vector2 p = RoadPoint(seg, i / 30.0f);
+                if (pass == 0) DrawCircleV(p, 15, Fade(open ? COLOR_CYAN : COLOR_PURPLE, open ? 0.14f : 0.07f));
+                else if (pass == 1) DrawCircleV(p, 8, COLOR_INK);
+                else if (open) DrawCircleV(p, ((i - pulse) % 8 + 8) % 8 == 0 ? 5.0f : 3.0f, ((i - pulse) % 8 + 8) % 8 == 0 ? WHITE : Fade(COLOR_CYAN, 0.8f));
+                else if (i % 4 == 0) DrawCircleV(p, 2.5f, (Color){90, 96, 150, 255});
+            }
+        }
+}
+
+// Hexagon level badge. Locked ones are dark with a padlock.
 static void DrawLevelNode(Vector2 c, int level, bool locked, bool available, int gems, bool isCurrent, bool hovered) {
     float t = (float)GetTime();
     bool boss = level == LEVEL_COUNT - 1;
     float r = boss ? 50.0f : 40.0f;
     if (hovered) r *= 1.07f;
+    if (level == app.unlockLevel && app.unlockTime < 0.7f) r *= 0.45f + 0.55f * EaseOutBack(app.unlockTime / 0.55f);
     float bounce = isCurrent ? -fabsf(sinf(t * 4.0f)) * 9.0f : 0;
-    DrawEllipse((int)c.x, (int)(c.y + r + 4), r * 0.9f, 9, Fade(COLOR_INK, 0.3f));
+    DrawEllipse((int)c.x, (int)(c.y + r + 4), r * 0.95f, 9, Fade(COLOR_CYAN, 0.22f));
     c.y += bounce;
-    Color col = locked ? (Color){156, 134, 196, 255} : LevelColor(level);
-    if (isCurrent) DrawRing(c, r + 9, r + 12 + sinf(t * 6) * 2, 0, 360, 48, Fade(WHITE, 0.75f));
-    DrawCircleV(c, r + 6, COLOR_INK);
-    DrawCircleV(c, r + 2, COLOR_CREAM);
-    DrawCircleV(c, r - 3, ColorBrightness(col, -0.22f));
-    DrawCircleV(V2(c.x, c.y - 3), r - 5, col);
-    DrawEllipse((int)(c.x - r * 0.15f), (int)(c.y - r * 0.5f), r * 0.5f, r * 0.24f, Fade(WHITE, 0.45f));
-    if (boss) DrawStarShape(V2(c.x, c.y - r - 14), 17, 0, COLOR_INK), DrawStarShape(V2(c.x, c.y - r - 14), 13, 0, locked ? COLOR_GRAY : COLOR_YELLOW);
+    Color col = locked ? (Color){84, 90, 130, 255} : LevelColor(level);
+    if (!locked) DrawNgon(c, 6, r + 16, 0, Fade(col, 0.13f));
+    if (isCurrent) DrawNgonLines(c, 6, r + 13 + sinf(t * 6) * 3, 0, 3, Fade(WHITE, 0.85f));
+    DrawNgon(c, 6, r + 6, 0, COLOR_INK);
+    DrawNgon(c, 6, r + 2, 0, col);
+    DrawNgon(c, 6, r - 4, 0, COLOR_INK);
+    DrawNgon(c, 6, r - 6, 0, Mix(col, locked ? 0.22f : (gems > 0 ? 0.5f : 0.28f)));
+    DrawRectangle((int)(c.x - r * 0.45f), (int)(c.y - r * 0.62f), (int)(r * 0.9f), 2, Fade(WHITE, 0.3f));
+    if (boss) { DrawStarShape(V2(c.x, c.y - r - 16), 17, 0, COLOR_INK); DrawStarShape(V2(c.x, c.y - r - 16), 13, 0, locked ? COLOR_GRAY : COLOR_YELLOW); }
     if (locked) {
         DrawPadlock(V2(c.x, c.y + 2), boss ? 1.5f : 1.25f, COLOR_GRAY);
     } else {
@@ -1152,19 +1246,20 @@ static void DrawLevelNode(Vector2 c, int level, bool locked, bool available, int
         snprintf(number, sizeof number, "%d", level + 1);
         DrawTextCO(number, (int)c.x, (int)c.y - (boss ? 22 : 19), boss ? 46 : 40, WHITE, COLOR_INK);
     }
-    if (available && !locked) DrawStarRow(c.x, c.y - bounce + r + 26, 11, gems, 99);
+    if (available && !locked) DrawStarRow(c.x, c.y - bounce + r + 28, 11, gems, 99);
     if (!available) {
         Rectangle tag = { c.x - 44, c.y - bounce + r + 14, 88, 24 };
         DrawRoundOutlined(tag, 12, 2, COLOR_CREAM, COLOR_INK);
-        DrawTextCentered("TYPED ONLY", (int)c.x, (int)tag.y + 5, 14, COLOR_INK);
+        DrawTextCentered("TYPED ONLY", (int)c.x, (int)tag.y + 5, 14, COLOR_TXT);
     }
 }
 
 static void DrawLevelPopup(void) {
     int level = app.selectedLevel;
     bool unlocked = IsLevelUnlocked(app.mode, level);
-    DrawRectangle(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT, Fade(COLOR_INK, 0.62f));
+    DrawRectangle(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT, Fade(COLOR_INK, 0.68f * Smooth(app.popupTime / 0.2f)));
     Rectangle p = { 290, 130, 420, 390 };
+    p.y += (1.0f - EaseOutBack(app.popupTime / 0.4f)) * -480.0f;
     DrawRound((Rectangle){ p.x + 4, p.y + 12, p.width, p.height }, 30, Fade(BLACK, 0.3f));
     DrawRoundOutlined(p, 30, 5, COLOR_CREAM, COLOR_INK);
     Rectangle ribbon = { p.x - 26, p.y - 30, p.width + 52, 64 };
@@ -1173,8 +1268,8 @@ static void DrawLevelPopup(void) {
     char title[24];
     snprintf(title, sizeof title, "LEVEL %d", level + 1);
     DrawTextCO(title, (int)(p.x + p.width / 2), (int)ribbon.y + 14, 38, WHITE, COLOR_INK);
-    DrawTextCentered(levelNames[level], (int)(p.x + p.width / 2), (int)p.y + 56, 24, COLOR_INK);
-    int y = WrapText(levelBlurbs[level], (int)p.x + 34, (int)p.y + 96, (int)p.width - 68, 20, (Color){100, 70, 140, 255}, true);
+    DrawTextCentered(levelNames[level], (int)(p.x + p.width / 2), (int)p.y + 56, 24, COLOR_TXT);
+    int y = WrapText(levelBlurbs[level], (int)p.x + 34, (int)p.y + 96, (int)p.width - 68, 20, COLOR_DIM, true);
     DrawStarRow(p.x + p.width / 2, p.y + 190, 28, app.progress.bestGems[app.mode][level], 99);
     int count = 0;
     for (int i = 0; i < QUESTION_BANK_SIZE; i++)
@@ -1182,7 +1277,7 @@ static void DrawLevelPopup(void) {
     char info[80];
     snprintf(info, sizeof info, "%s MODE  -  %d questions  -  3 stars = all right", app.mode == MODE_MCQ ? "MCQ" : "TYPED", count);
     (void)y;
-    DrawTextCentered(info, (int)(p.x + p.width / 2), (int)p.y + 244, 16, (Color){120, 90, 160, 255});
+    DrawTextCentered(info, (int)(p.x + p.width / 2), (int)p.y + 244, 16, COLOR_DIM);
     const char *label = app.progress.bestGems[app.mode][level] > 0 ? "REPLAY" : "PLAY";
     if (DrawCandyButton((Rectangle){ p.x + 90, p.y + 284, 240, 70 }, label, COLOR_GREEN, unlocked, 34) || (unlocked && IsKeyPressed(KEY_ENTER))) StartLevel(level);
     Rectangle closeButton = { p.x + p.width - 44, p.y - 40, 52, 48 };
@@ -1193,22 +1288,32 @@ static void DrawLevelPopup(void) {
 }
 
 static void ScreenMap(void) {
-    float t = (float)GetTime();
-    DrawBackground(0.1f);
-    DrawCloud(V2(180 + sinf(t * 0.3f) * 18, 140), 0.9f, Fade(WHITE, 0.5f));
-    DrawCloud(V2(560 + sinf(t * 0.2f) * 22, 150), 0.7f, Fade(WHITE, 0.45f));
-    DrawCloud(V2(930, 410), 0.8f, Fade(WHITE, 0.4f));
-    DrawEllipse(120, 660, 330, 150, (Color){255, 172, 216, 255});
-    DrawEllipse(880, 670, 380, 130, (Color){255, 150, 202, 255});
-    DrawLollipop(V2(60, 300), 26, COLOR_PINK, COLOR_CREAM, 0.15f);
-    DrawLollipop(V2(960, 330), 24, COLOR_CYAN, COLOR_CREAM, -0.2f);
-    DrawCupcake(V2(910, 612), 0.8f);
-    DrawCupcake(V2(60, 620), 0.8f);
-    DrawWrappedCandy(V2(430, 250 + sinf(t * 1.6f) * 6), 16, COLOR_YELLOW, t * 0.6f);
-    DrawBean(V2(590, 200 + sinf(t * 1.9f) * 5), 40, 18, COLOR_GREEN, 0.6f);
-    DrawBean(V2(250, 560 + sinf(t * 1.7f) * 5), 38, 16, COLOR_ORANGE, -0.5f);
+    float t = (float)GetTime(), dt = GetFrameTime();
+    // robot hops to the level that just unlocked, then (optionally) its popup opens
+    if (app.pendingHop >= 0 && app.hopTo < 0) { app.hopFrom = app.pendingHop; app.hopTo = app.hopFrom + 1; app.hopTime = -0.7f; app.pendingHop = -1; }
+    if (app.hopTo >= 0) {
+        app.hopTime += dt;
+        if (app.hopTime >= 1.5f) { SpawnBurst(nodePos[app.hopTo], 60); app.unlockLevel = app.hopTo; app.unlockTime = 0; app.hopTo = -1; }
+    }
+    if (app.unlockLevel >= 0) { app.unlockTime += dt; if (app.unlockTime > 2.4f) app.unlockLevel = -1; }
+    if (app.selectedLevel >= 0) app.popupTime += dt;
+    if (app.autoOpenLevel >= 0 && app.hopTo < 0 && app.pendingHop < 0 && app.screenTime > 0.6f && (app.unlockLevel < 0 || app.unlockTime > 1.2f)) {
+        if (IsLevelUnlocked(app.mode, app.autoOpenLevel)) { app.selectedLevel = app.autoOpenLevel; app.popupTime = 0; }
+        app.autoOpenLevel = -1;
+    }
 
-    uiLocked = app.selectedLevel >= 0 || app.toastTime < -1;
+    DrawBackground(0.1f);
+    DrawCloud(V2(180 + sinf(t * 0.3f) * 18, 130), 0.9f, Fade(WHITE, 0.6f));
+    DrawCloud(V2(580 + sinf(t * 0.2f) * 22, 140), 0.7f, Fade(WHITE, 0.5f));
+    DrawLollipop(V2(60, 300), 26, COLOR_CYAN, COLOR_CREAM, 0.15f);
+    DrawLollipop(V2(960, 330), 24, COLOR_YELLOW, COLOR_CREAM, -0.2f);
+    DrawCupcake(V2(920, 620), 0.8f);
+    DrawCupcake(V2(60, 624), 0.8f);
+    DrawWrappedCandy(V2(430, 250 + sinf(t * 1.6f) * 6), 16, COLOR_YELLOW, t * 0.6f);
+    DrawBean(V2(590, 205 + sinf(t * 1.9f) * 5), 40, 12, COLOR_GREEN, 0.6f);
+    DrawBean(V2(250, 560 + sinf(t * 1.7f) * 5), 38, 12, COLOR_ORANGE, -0.5f);
+
+    uiLocked = app.selectedLevel >= 0 || app.hopTo >= 0;
     DrawRoad();
     int current = CurrentLevelForMap();
     int hoveredLevel = -1;
@@ -1217,40 +1322,60 @@ static void ScreenMap(void) {
         bool unlocked = IsLevelUnlocked(app.mode, level);
         bool hovered = !uiLocked && CheckCollisionPointCircle(GetMousePosition(), nodePos[level], level == LEVEL_COUNT - 1 ? 52 : 42);
         if (hovered) hoveredLevel = level;
-        DrawLevelNode(nodePos[level], level, !unlocked, available, app.progress.bestGems[app.mode][level], level == current && unlocked, hovered);
+        DrawLevelNode(nodePos[level], level, !MapUnlocked(level), available, app.progress.bestGems[app.mode][level], level == current && MapUnlocked(level), hovered);
         if (TakeClick(hovered)) {
             if (!available) ShowToast("Switch to TYPED mode to enter the Function Lab!");
             else if (!unlocked) { char msg[64]; snprintf(msg, sizeof msg, "Earn a star on level %d first!", level); ShowToast(msg); }
-            else app.selectedLevel = level;
+            else { app.selectedLevel = level; app.popupTime = 0; }
         }
+    }
+    if (app.unlockLevel >= 0 && app.unlockTime < 1.0f) {
+        float radius = 40 + app.unlockTime * 170;
+        DrawRing(nodePos[app.unlockLevel], radius, radius + 6, 0, 360, 48, Fade(LevelColor(app.unlockLevel), 1.0f - app.unlockTime));
     }
     if (hoveredLevel >= 0) {
         int w = MeasureText(levelNames[hoveredLevel], 18) + 30;
         Rectangle tip = { nodePos[hoveredLevel].x - w / 2.0f, nodePos[hoveredLevel].y - 98, (float)w, 32 };
         if (hoveredLevel == LEVEL_COUNT - 1) tip.y -= 14;
         DrawRoundOutlined(tip, 16, 3, COLOR_CREAM, COLOR_INK);
-        DrawTextCentered(levelNames[hoveredLevel], (int)(tip.x + tip.width / 2), (int)tip.y + 7, 18, COLOR_INK);
+        DrawTextCentered(levelNames[hoveredLevel], (int)(tip.x + tip.width / 2), (int)tip.y + 7, 18, COLOR_TXT);
     }
-    Vector2 botSpot = nodePos[current];
-    DrawBot(botSpot.x - 78, botSpot.y + 36, 0.62f, MOOD_HAPPY);
+    Vector2 botFoot = V2(nodePos[current].x - 78, nodePos[current].y + 36);
+    BotMood botMood = MOOD_HAPPY;
+    if (app.hopTo >= 0) {
+        float f = Clampf(app.hopTime / 1.5f, 0, 1);
+        Vector2 p = RoadPoint(app.hopFrom, f);
+        float lift = (f > 0 && f < 1) ? fabsf(sinf(f * PI * 4)) * 32 : 0;
+        botFoot = V2(p.x - 78, p.y + 36 - lift);
+        botMood = f > 0 ? MOOD_CHEER : MOOD_HAPPY;
+    }
+    DrawBot(botFoot.x, botFoot.y, 0.62f, botMood);
 
     DrawHeaderBar("LEVEL MAP", 122, true);
-    if (DrawCandyButton((Rectangle){ 12, 8, 100, 44 }, "BACK", COLOR_PINK, true, 20)) SetScreen(SCREEN_MODE);
+    if (DrawCandyButton((Rectangle){ 12, 8, 100, 44 }, "BACK", COLOR_ORANGE, true, 20)) SetScreen(SCREEN_MODE);
     char modeLabel[32];
     snprintf(modeLabel, sizeof modeLabel, "MODE: %s", app.mode == MODE_MCQ ? "MCQ" : "TYPED");
-    if (DrawCandyButton((Rectangle){ 440, 8, 220, 44 }, modeLabel, COLOR_ORANGE, true, 20)) app.mode = app.mode == MODE_MCQ ? MODE_TYPED : MODE_MCQ;
+    if (DrawCandyButton((Rectangle){ 440, 8, 220, 44 }, modeLabel, COLOR_YELLOW, true, 20)) app.mode = app.mode == MODE_MCQ ? MODE_TYPED : MODE_MCQ;
 
     int weakIds[MAX_QUESTIONS_PER_LEVEL];
     int weakCount = CollectWeak(weakIds, MAX_QUESTIONS_PER_LEVEL);
     char weakLabel[40];
     snprintf(weakLabel, sizeof weakLabel, weakCount ? "WEAK SPOTS (%d)" : "WEAK SPOTS", weakCount);
     if (DrawCandyButton((Rectangle){ 25, 572, 270, 54 }, weakLabel, COLOR_CYAN, true, 22)) StartPractice();
-    if (DrawCandyButton((Rectangle){ 705, 572, 270, 54 }, "MY PROGRESS", COLOR_PINK, true, 24)) {
+    if (DrawCandyButton((Rectangle){ 705, 572, 270, 54 }, "MY PROGRESS", COLOR_PURPLE, true, 24)) {
         app.reviewTab = 0;
         app.reviewCount = 0;
         SetScreen(SCREEN_REVIEW);
     }
-    if (IsKeyPressed(KEY_ESCAPE) && app.selectedLevel < 0) SetScreen(SCREEN_MODE);
+    if (app.unlockLevel >= 0) {
+        float a = Smooth(app.unlockTime / 0.3f) * (1.0f - Smooth((app.unlockTime - 2.0f) / 0.4f));
+        Rectangle banner = { 290, 84 - 70 * (1 - a), 420, 50 };
+        char text[40];
+        snprintf(text, sizeof text, "LEVEL %d UNLOCKED!", app.unlockLevel + 1);
+        DrawRoundOutlined(banner, 16, 3, COLOR_CREAM, COLOR_YELLOW);
+        DrawTextCO(text, 500, (int)banner.y + 12, 26, COLOR_YELLOW, COLOR_INK);
+    }
+    if (IsKeyPressed(KEY_ESCAPE) && app.selectedLevel < 0 && app.hopTo < 0) SetScreen(SCREEN_MODE);
 
     if (app.selectedLevel >= 0) {
         uiLocked = false;
@@ -1265,7 +1390,7 @@ static Color StatusColor(QStatus status) {
         case ST_WRONG:   return COLOR_RED;
         case ST_SKIPPED: return COLOR_YELLOW;
         case ST_FIXED:   return COLOR_CYAN;
-        default:         return COLOR_CREAM;
+        default:         return (Color){70, 84, 140, 255};
     }
 }
 
@@ -1281,7 +1406,7 @@ static void DrawQuestionPips(void) {
         DrawCircleV(c, r, StatusColor(app.qStatus[i]));
         char number[4];
         snprintf(number, sizeof number, "%d", i + 1);
-        DrawTextCentered(number, (int)c.x, (int)c.y - 8, 18, COLOR_INK);
+        DrawTextCentered(number, (int)c.x, (int)c.y - 8, 18, app.qStatus[i] == ST_UNSEEN ? COLOR_TXT : COLOR_INK);
         if (TakeClick(hovered) && i != app.current) GoToQuestion(i);
     }
 }
@@ -1291,13 +1416,13 @@ static void DrawFeedbackSheet(void) {
     float h = 252, a = Smooth(app.sheetTime / 0.25f);
     float top = WINDOW_HEIGHT - h * a;
     bool correct = app.lastAnswerCorrect;
-    Color base = correct ? (Color){216, 255, 226, 255} : (Color){255, 228, 234, 255};
-    Color edge = correct ? (Color){40, 170, 80, 255} : (Color){220, 60, 80, 255};
+    Color base = correct ? (Color){6, 44, 30, 255} : (Color){50, 8, 24, 255};
+    Color edge = correct ? COLOR_GREEN : COLOR_RED;
     DrawRoundOutlined((Rectangle){ -12, top, WINDOW_WIDTH + 24, h + 40 }, 30, 5, base, edge);
-    DrawRound((Rectangle){ 30, top + 9, 300, 8 }, 4, Fade(WHITE, 0.7f));
+    DrawRound((Rectangle){ 30, top + 9, 300, 6 }, 3, Fade(edge, 0.7f));
     DrawTextO(app.feedbackHead, 40, (int)top + 26, 44, correct ? COLOR_GREEN : COLOR_RED, COLOR_INK);
     const char *text = (!correct && app.revealed) ? app.revealText : app.feedbackText;
-    WrapText(text, 40, (int)top + 84, 700, 19, COLOR_INK, true);
+    WrapText(text, 40, (int)top + 84, 700, 19, COLOR_TXT, true);
 
     bool ready = app.sheetTime > 0.18f;
     bool goNext = false, tryAgain = false;
@@ -1324,25 +1449,60 @@ static void DrawQuitConfirm(void) {
     DrawRectangle(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT, Fade(COLOR_INK, 0.65f));
     Rectangle p = { 300, 190, 400, 240 };
     DrawRoundOutlined(p, 28, 5, COLOR_CREAM, COLOR_INK);
-    DrawTextCentered("Leave this level?", 500, 216, 32, COLOR_INK);
-    WrapText("Your answers in this run will be lost, but your lifetime stats are kept.", 330, 266, 340, 18, (Color){100, 70, 140, 255}, true);
+    DrawTextCentered("Leave this level?", 500, 216, 32, COLOR_TXT);
+    WrapText("Your answers in this run will be lost, but your lifetime stats are kept.", 330, 266, 340, 18, COLOR_DIM, true);
     if (DrawCandyButton((Rectangle){ 322, 346, 170, 58 }, "STAY", COLOR_GREEN, true, 26) || IsKeyPressed(KEY_ESCAPE)) app.confirmQuit = false;
     if (DrawCandyButton((Rectangle){ 508, 346, 170, 58 }, "LEAVE", COLOR_RED, true, 26)) { app.confirmQuit = false; SetScreen(SCREEN_MAP); }
 }
 
+static void DrawLevelIntro(void) {
+    const float duration = 2.1f;
+    float e = duration - app.introTime;
+    float k = Smooth(e / 0.35f) * (1.0f - Smooth((e - (duration - 0.4f)) / 0.4f));
+    if (k <= 0.01f) return;
+    float t = (float)GetTime();
+    DrawRectangle(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT, Fade(COLOR_INK, 0.62f * k));
+    float h = 240 * k, y = 320 - h / 2;
+    DrawRectangle(0, (int)y, WINDOW_WIDTH, (int)h, (Color){6, 6, 34, 248});
+    DrawRectangle(0, (int)y - 3, WINDOW_WIDTH, 3, COLOR_CYAN);
+    DrawRectangle(0, (int)(y + h), WINDOW_WIDTH, 3, COLOR_CYAN);
+    DrawRectangle(0, (int)(y + h) + 3, WINDOW_WIDTH, 8, Fade(COLOR_CYAN, 0.18f));
+    for (int x = -40 + (int)fmodf(t * 80, 40); x < WINDOW_WIDTH; x += 40) {
+        DrawRectangle(x, (int)y + 6, 20, 5, Fade(COLOR_YELLOW, 0.85f));
+        DrawRectangle(WINDOW_WIDTH - x - 20, (int)(y + h) - 11, 20, 5, Fade(COLOR_YELLOW, 0.85f));
+    }
+    if (k < 0.85f) return;
+    float slideIn = (1.0f - Smooth((e - 0.15f) / 0.4f)) * -600.0f;
+    float slideOut = Smooth((e - (duration - 0.45f)) / 0.45f) * 700.0f;
+    int ox = (int)(slideIn + slideOut);
+    char title[40], info[80];
+    if (app.levelIndex >= 0) snprintf(title, sizeof title, "LEVEL %d", app.levelIndex + 1); else snprintf(title, sizeof title, "PRACTICE");
+    DrawText(title, 60 + ox - 4, (int)y + 34, 84, Fade(COLOR_CYAN, 0.7f));
+    DrawText(title, 60 + ox + 4, (int)y + 34, 84, Fade(COLOR_PURPLE, 0.7f));
+    DrawTextO(title, 60 + ox, (int)y + 34, 84, WHITE, COLOR_INK);
+    DrawText(app.levelIndex >= 0 ? levelNames[app.levelIndex] : "Weak spot mission", 64 + ox * 2, (int)y + 128, 30, COLOR_CYAN);
+    snprintf(info, sizeof info, "%d QUESTIONS  //  HALF RIGHT = 1 STAR", app.questionCount);
+    DrawText(info, 64 + ox * 3, (int)y + 170, 20, COLOR_YELLOW);
+    if ((int)(t * 3) % 2 == 0) DrawText("> READY?", 64 + ox * 3, (int)y + 198, 20, COLOR_GREEN);
+    DrawBot(850 - ox, y + h - 8, 1.5f, MOOD_CHEER);
+}
+
 static void ScreenQuestion(void) {
     const Question *question = CurrentQuestion();
-    bool blocked = app.sheetOpen || app.confirmQuit || app.runCountdown > 0;
+    float frameTime = GetFrameTime();
+    app.qTime += frameTime;
+    if (app.introTime > 0 && app.screenTime > 0.3f) app.introTime -= frameTime;
+    bool blocked = app.sheetOpen || app.confirmQuit || app.runCountdown > 0 || app.introTime > 0;
     uiLocked = blocked;
     DrawBackground(0.28f);
 
     // ---- prompt card and snippet
-    int x = 30, width = 740, y = 98;
-    int textEnd = WrapText(question->prompt, x + 22, y + 14, width - 44, 22, COLOR_INK, false);
+    int x = 30 + (int)((1.0f - Smooth(app.qTime / 0.28f)) * 90.0f), width = 740, y = 98;
+    int textEnd = WrapText(question->prompt, x + 22, y + 14, width - 44, 22, COLOR_TXT, false);
     Rectangle card = { (float)x, (float)y, (float)width, (float)(textEnd - (y + 14) + 22) };
     DrawRound((Rectangle){ card.x + 3, card.y + 8, card.width, card.height }, 22, Fade(BLACK, 0.2f));
     DrawRoundOutlined(card, 22, 4, COLOR_CREAM, COLOR_INK);
-    WrapText(question->prompt, x + 22, y + 14, width - 44, 22, COLOR_INK, true);
+    WrapText(question->prompt, x + 22, y + 14, width - 44, 22, COLOR_TXT, true);
     int contentY = (int)(card.y + card.height) + 14;
     if (question->snippet[0]) {
         Rectangle code = { (float)x, (float)contentY, (float)width, (float)(CountLines(question->snippet) * 26 + 22) };
@@ -1361,15 +1521,15 @@ static void ScreenQuestion(void) {
             if (app.sheetOpen) {
                 bool showRight = app.lastAnswerCorrect || app.revealed;
                 if (option == app.lastChoice && !app.lastAnswerCorrect) { fill = COLOR_RED; grey = false; }
-                else if (showRight && option == question->correctOption) fill = (Color){40, 200, 90, 255};
+                else if (showRight && option == question->correctOption) fill = (Color){20, 230, 110, 255};
             }
             if (DrawCandyButton(r, "", fill, !grey, 20) && !blocked) chosen = option;
             if (!blocked && IsKeyPressed(KEY_ONE + option) && !grey) chosen = option;
             float cy = r.y + (r.height - 7) / 2;
-            DrawCircleV(V2(r.x + 30, cy), 17, COLOR_INK);
-            DrawCircleV(V2(r.x + 30, cy), 14, COLOR_CREAM);
+            DrawCircleV(V2(r.x + 30, cy), 17, fill);
+            DrawCircleV(V2(r.x + 30, cy), 14, COLOR_CODE_BG);
             char letter[2] = { (char)('A' + option), 0 };
-            DrawTextCentered(letter, (int)r.x + 30, (int)cy - 9, 20, COLOR_INK);
+            DrawTextCentered(letter, (int)r.x + 30, (int)cy - 9, 20, COLOR_TXT);
             DrawTextO(question->options[option], (int)r.x + 62, (int)cy - 11, 22, WHITE, ColorBrightness(fill, -0.6f));
         }
         if (chosen >= 0) {
@@ -1387,13 +1547,13 @@ static void ScreenQuestion(void) {
         DrawRoundOutlined(box, 20, 4, COLOR_CREAM, COLOR_INK);
         char shown[110];
         snprintf(shown, sizeof shown, "%s%s", app.typedAnswer, (int)(GetTime() * 2) % 2 == 0 && !blocked ? "_" : "");
-        DrawText(shown, x + 22, contentY + 38 + 17, 30, COLOR_INK);
+        DrawText(shown, x + 22, contentY + 38 + 17, 30, COLOR_TXT);
     } else {
         if (!blocked) HandleCodeInput();
         Rectangle editor = { (float)x, (float)contentY, (float)width, (float)(564 - contentY) };
         DrawRoundOutlined(editor, 18, 4, COLOR_CODE_BG, COLOR_INK);
-        DrawRound((Rectangle){ editor.x, editor.y, editor.width, 30 }, 18, (Color){70, 48, 140, 255});
-        DrawRectangle((int)editor.x, (int)editor.y + 16, (int)editor.width, 14, (Color){70, 48, 140, 255});
+        DrawRound((Rectangle){ editor.x, editor.y, editor.width, 30 }, 18, (Color){24, 34, 90, 255});
+        DrawRectangle((int)editor.x, (int)editor.y + 16, (int)editor.width, 14, (Color){24, 34, 90, 255});
         DrawCircleV(V2(editor.x + 20, editor.y + 15), 5, COLOR_RED);
         DrawCircleV(V2(editor.x + 38, editor.y + 15), 5, COLOR_YELLOW);
         DrawCircleV(V2(editor.x + 56, editor.y + 15), 5, COLOR_GREEN);
@@ -1405,7 +1565,7 @@ static void ScreenQuestion(void) {
         for (int i = 0; i < lines; i++) {
             char number[8];
             snprintf(number, sizeof number, "%d", i + 1);
-            DrawText(number, (int)editor.x + 14, lineY + i * 26, 20, (Color){120, 100, 170, 255});
+            DrawText(number, (int)editor.x + 14, lineY + i * 26, 20, (Color){90, 100, 160, 255});
         }
         DrawCodeBlock(app.codeAnswer, (int)editor.x + 52, lineY, 20, (Color){160, 255, 180, 255});
         const char *lineStart = app.codeAnswer;
@@ -1425,7 +1585,7 @@ static void ScreenQuestion(void) {
     else if (question->kind == KIND_MCQ) snprintf(bubbleText, sizeof bubbleText, "Tap an answer! Stuck? Ask me for a HINT.");
     else if (question->kind == KIND_SHORT) snprintf(bubbleText, sizeof bubbleText, "Type it in and press ENTER!");
     else snprintf(bubbleText, sizeof bubbleText, "Write the function. CTRL+ENTER runs the tests!");
-    int bubbleBottom = WrapText(bubbleText, 0, 0, 161, 16, COLOR_INK, false);
+    int bubbleBottom = WrapText(bubbleText, 0, 0, 161, 16, COLOR_TXT, false);
     DrawBubble((Rectangle){ 790, 98, 185, (float)(bubbleBottom + 14) }, bubbleText, 16, 880);
     BotMood mood = MOOD_THINK;
     float footY = 424;
@@ -1437,7 +1597,7 @@ static void ScreenQuestion(void) {
         DrawRoundOutlined(chip, 17, 3, COLOR_CREAM, COLOR_INK);
         char fitted[48];
         FitText(app.levelIndex >= 0 ? levelNames[app.levelIndex] : "Weak spot practice", fitted, sizeof fitted, 165, 16);
-        DrawTextCentered(fitted, 882, 449, 16, COLOR_INK);
+        DrawTextCentered(fitted, 882, 449, 16, COLOR_TXT);
         snprintf(info, sizeof info, "Question %d of %d", app.current + 1, app.questionCount);
         DrawTextCO(info, 882, 488, 20, WHITE, COLOR_INK);
         if (app.streak > 1) {
@@ -1465,7 +1625,7 @@ static void ScreenQuestion(void) {
     if ((hintClicked || (!blocked && IsKeyPressed(KEY_F1))) && !app.qHint[app.current]) app.qHint[app.current] = true;
     bool others = NextUnresolved(app.current) >= 0;
     const char *skipLabel = !others ? "FINISH" : (IsResolved(app.qStatus[app.current]) ? "NEXT" : "SKIP");
-    if (DrawCandyButton((Rectangle){ 310, 572, 150, 54 }, skipLabel, others ? COLOR_CYAN : COLOR_PINK, true, 22)) SkipOrNext();
+    if (DrawCandyButton((Rectangle){ 310, 572, 150, 54 }, skipLabel, others ? COLOR_CYAN : COLOR_GREEN, true, 22)) SkipOrNext();
 
     if (question->kind == KIND_SHORT) {
         bool submit = DrawCandyButton((Rectangle){ 790, 572, 185, 54 }, "SUBMIT", COLOR_GREEN, app.typedLength > 0, 24);
@@ -1497,6 +1657,12 @@ static void ScreenQuestion(void) {
         DrawFeedbackSheet();
         if (app.sheetOpen) DrawBot(882, WINDOW_HEIGHT - 252 * Smooth(app.sheetTime / 0.25f) + 8, 1.15f, app.lastAnswerCorrect ? MOOD_CHEER : MOOD_SAD);
     }
+    if (app.introTime > 0) {
+        uiLocked = false;
+        if (app.introTime > 0.45f && (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) || IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_SPACE))) app.introTime = 0.45f;
+        DrawLevelIntro();
+        return;
+    }
     if (app.confirmQuit) { uiLocked = false; DrawQuitConfirm(); }
     else if (IsKeyPressed(KEY_ESCAPE) && !app.sheetOpen && app.runCountdown == 0) app.confirmQuit = true;
 }
@@ -1507,25 +1673,23 @@ static void ScreenResults(void) {
     bool practice = app.levelIndex < 0;
     bool pass = practice ? app.correctCount * 2 >= app.questionCount : app.levelGems > 0;
     DrawBackground(0.1f);
-    DrawEllipse(170, 660, 430, 160, (Color){255, 170, 214, 255});
-    DrawEllipse(830, 670, 470, 150, (Color){255, 146, 200, 255});
     if (pass && t < 2.0f && (int)(t * 60) % 4 == 0) SpawnConfetti(2);
 
     Rectangle card = { 250, 112, 500, 450 };
     DrawRound((Rectangle){ card.x + 4, card.y + 12, card.width, card.height }, 30, Fade(BLACK, 0.28f));
     DrawRoundOutlined(card, 30, 5, COLOR_CREAM, COLOR_INK);
     Rectangle ribbon = { card.x - 30, card.y - 34, card.width + 60, 70 };
-    DrawRoundOutlined(ribbon, 20, 4, pass ? COLOR_GREEN : COLOR_PINK, COLOR_INK);
+    DrawRoundOutlined(ribbon, 20, 4, pass ? COLOR_GREEN : COLOR_RED, COLOR_INK);
     DrawRound((Rectangle){ ribbon.x + 24, ribbon.y + 7, ribbon.width - 48, 15 }, 7, Fade(WHITE, 0.3f));
     DrawTextCO(practice ? "PRACTICE DONE!" : (pass ? "LEVEL CLEAR!" : "OH NO! TRY AGAIN"), 500, (int)ribbon.y + 16, 40, WHITE, COLOR_INK);
 
     char line[96];
     if (practice) snprintf(line, sizeof line, "Weak spot practice");
     else snprintf(line, sizeof line, "Level %d - %s", app.levelIndex + 1, levelNames[app.levelIndex]);
-    DrawTextCentered(line, 500, (int)card.y + 50, 22, (Color){100, 70, 140, 255});
+    DrawTextCentered(line, 500, (int)card.y + 50, 22, COLOR_DIM);
     if (!practice) DrawStarRow(500, card.y + 128, 36, app.levelGems, t - 0.3f);
     snprintf(line, sizeof line, "SCORE %d / %d      +%d XP", app.correctCount, app.questionCount, app.levelXp);
-    DrawTextCentered(line, 500, (int)card.y + (practice ? 110 : 190), 28, COLOR_INK);
+    DrawTextCentered(line, 500, (int)card.y + (practice ? 110 : 190), 28, COLOR_TXT);
 
     float spacing = 46, startX = 500 - (app.questionCount - 1) * spacing / 2;
     int mistakes = 0;
@@ -1543,10 +1707,10 @@ static void ScreenResults(void) {
     else if (app.levelGems == 3) message = "Perfect! Every sweet answer was right.";
     else if (pass) message = "Checkpoint saved. Replay for 3 stars any time!";
     else message = "You need at least half right for a star. Review and retry!";
-    WrapText(message, (int)card.x + 40, (int)card.y + 276, 420, 18, (Color){100, 70, 140, 255}, true);
+    WrapText(message, (int)card.x + 40, (int)card.y + 276, 420, 18, COLOR_DIM, true);
     if (app.fixedCount > 0) {
         snprintf(line, sizeof line, "You fixed %d mistake%s on a retry!", app.fixedCount, app.fixedCount == 1 ? "" : "s");
-        DrawTextCentered(line, 500, (int)card.y + 304, 18, (Color){20, 150, 190, 255});
+        DrawTextCentered(line, 500, (int)card.y + 304, 18, COLOR_CYAN);
     }
 
     if (DrawCandyButton((Rectangle){ card.x + 40, card.y + 330, 420, 54 }, mistakes ? "REVIEW MY MISTAKES" : "OPEN MY PROGRESS", COLOR_CYAN, true, 24)) {
@@ -1564,10 +1728,10 @@ static void ScreenResults(void) {
         if (practice) StartPractice(); else StartLevel(app.levelIndex);
         return;
     }
-    if (DrawCandyButton((Rectangle){ card.x + 335, by, 140, 54 }, "NEXT", COLOR_GREEN, nextReady, 22)) { StartLevel(nextLevel); return; }
+    if (DrawCandyButton((Rectangle){ card.x + 335, by, 140, 54 }, "NEXT", COLOR_GREEN, nextReady, 22)) { app.autoOpenLevel = nextLevel; SetScreen(SCREEN_MAP); return; }
 
     DrawBot(125, 572, 1.7f, pass ? MOOD_CHEER : MOOD_SAD);
-    DrawLollipop(V2(880, 420), 34, COLOR_PINK, COLOR_CREAM, -0.2f);
+    DrawLollipop(V2(880, 420), 34, COLOR_CYAN, COLOR_CREAM, -0.2f);
     DrawCupcake(V2(880, 612), 0.9f);
 }
 
@@ -1590,8 +1754,8 @@ static int DrawQuestionDetail(const Question *q, int x, int y, int w, bool draw)
         first[n] = '\0';
         snprintf(answer, sizeof answer, "Answer: %s", first);
     }
-    if (answer[0]) y = WrapText(answer, x, y, w, 20, (Color){20, 130, 70, 255}, draw);
-    return WrapText(q->explanation, x, y, w, 18, COLOR_INK, draw);
+    if (answer[0]) y = WrapText(answer, x, y, w, 20, COLOR_GREEN, draw);
+    return WrapText(q->explanation, x, y, w, 18, COLOR_TXT, draw);
 }
 
 static void BuildReviewList(int tab) {
@@ -1609,7 +1773,7 @@ static void BuildReviewList(int tab) {
 
 static void DrawCountBadge(float x, float y, int value, Color color) {
     DrawCircleV(V2(x, y), 15, COLOR_INK);
-    DrawCircleV(V2(x, y), 12, value > 0 ? color : (Color){225, 215, 238, 255});
+    DrawCircleV(V2(x, y), 12, value > 0 ? color : (Color){50, 48, 96, 255});
     char text[8];
     snprintf(text, sizeof text, "%d", value);
     DrawTextCentered(text, (int)x, (int)y - 7, 16, COLOR_INK);
@@ -1624,17 +1788,17 @@ static void DrawReviewOverview(Rectangle panel) {
     }
     int percent = totalAttempts ? totalCorrect * 100 / totalAttempts : 0;
     Vector2 ring = V2(panel.x + 160, panel.y + 118);
-    DrawRing(ring, 56, 80, 0, 360, 60, (Color){232, 218, 245, 255});
+    DrawRing(ring, 56, 80, 0, 360, 60, (Color){34, 32, 84, 255});
     if (totalAttempts) DrawRing(ring, 56, 80, 270, 270 + 360.0f * percent / 100.0f, 60, percent >= 80 ? COLOR_GREEN : (percent >= 50 ? COLOR_YELLOW : COLOR_RED));
     char text[64];
     snprintf(text, sizeof text, totalAttempts ? "%d%%" : "--", percent);
-    DrawTextCentered(text, (int)ring.x, (int)ring.y - 20, 38, COLOR_INK);
-    DrawTextCentered("correct", (int)ring.x, (int)ring.y + 18, 16, (Color){120, 90, 160, 255});
+    DrawTextCentered(text, (int)ring.x, (int)ring.y - 20, 38, COLOR_TXT);
+    DrawTextCentered("correct", (int)ring.x, (int)ring.y + 18, 16, COLOR_DIM);
     int stars = TotalStars();
-    snprintf(text, sizeof text, "Answers given: %d", totalAttempts);        DrawText(text, (int)panel.x + 30, (int)panel.y + 214, 20, COLOR_INK);
-    snprintf(text, sizeof text, "Mistakes: %d", totalAttempts - totalCorrect); DrawText(text, (int)panel.x + 30, (int)panel.y + 238, 20, COLOR_INK);
-    snprintf(text, sizeof text, "Skipped: %d", totalSkipped);                DrawText(text, (int)panel.x + 30, (int)panel.y + 262, 20, COLOR_INK);
-    snprintf(text, sizeof text, "Stars: %d / 27", stars);                    DrawText(text, (int)panel.x + 30, (int)panel.y + 286, 20, COLOR_INK);
+    snprintf(text, sizeof text, "Answers given: %d", totalAttempts);        DrawText(text, (int)panel.x + 30, (int)panel.y + 214, 20, COLOR_TXT);
+    snprintf(text, sizeof text, "Mistakes: %d", totalAttempts - totalCorrect); DrawText(text, (int)panel.x + 30, (int)panel.y + 238, 20, COLOR_TXT);
+    snprintf(text, sizeof text, "Skipped: %d", totalSkipped);                DrawText(text, (int)panel.x + 30, (int)panel.y + 262, 20, COLOR_TXT);
+    snprintf(text, sizeof text, "Stars: %d / 27", stars);                    DrawText(text, (int)panel.x + 30, (int)panel.y + 286, 20, COLOR_TXT);
 
     // robot's advice
     int worstLevel = -1, worstPercent = 101;
@@ -1648,14 +1812,14 @@ static void DrawReviewOverview(Rectangle panel) {
     else if (worstPercent < 85) snprintf(advice, sizeof advice, "Focus on \"%s\": only %d%% right so far. Hit PLAY to improve it!", levelNames[worstLevel], worstPercent);
     else snprintf(advice, sizeof advice, "Looking strong! Try for 3 stars on every level.");
     Rectangle note = { panel.x + 24, panel.y + 318, 296, 76 };
-    DrawRoundOutlined(note, 14, 3, (Color){255, 244, 200, 255}, COLOR_INK);
-    WrapText(advice, (int)note.x + 12, (int)note.y + 8, (int)note.width - 24, 16, COLOR_INK, true);
+    DrawRoundOutlined(note, 14, 3, (Color){44, 38, 8, 255}, COLOR_INK);
+    WrapText(advice, (int)note.x + 12, (int)note.y + 8, (int)note.width - 24, 16, COLOR_TXT, true);
 
     // per level rows
-    DrawTextCentered("YOUR LEVELS", (int)(panel.x + 640), (int)panel.y + 10, 22, COLOR_INK);
+    DrawTextCentered("YOUR LEVELS", (int)(panel.x + 640), (int)panel.y + 10, 22, COLOR_TXT);
     for (int l = 0; l < LEVEL_COUNT; l++) {
         Rectangle row = { panel.x + 350, panel.y + 42 + l * 72.0f, 570, 62 };
-        DrawRoundOutlined(row, 18, 3, WHITE, (Color){228, 206, 240, 255});
+        DrawRoundOutlined(row, 18, 3, (Color){18, 16, 52, 255}, (Color){62, 56, 128, 255});
         int attempts, correct, weak;
         LevelReport(l, &attempts, &correct, &weak);
         int pct = attempts ? correct * 100 / attempts : 0;
@@ -1664,12 +1828,12 @@ static void DrawReviewOverview(Rectangle panel) {
         char number[4];
         snprintf(number, sizeof number, "%d", l + 1);
         DrawTextCO(number, (int)row.x + 32, (int)row.y + 18, 26, WHITE, COLOR_INK);
-        DrawText(levelNames[l], (int)row.x + 66, (int)row.y + 7, 20, COLOR_INK);
+        DrawText(levelNames[l], (int)row.x + 66, (int)row.y + 7, 20, COLOR_TXT);
         Rectangle track = { row.x + 66, row.y + 36, 220, 14 };
-        DrawRound(track, 7, (Color){232, 218, 245, 255});
+        DrawRound(track, 7, (Color){34, 32, 84, 255});
         if (attempts) DrawRound((Rectangle){ track.x, track.y, track.width * pct / 100.0f < 14 ? 14 : track.width * pct / 100.0f, track.height }, 7, pct >= 80 ? COLOR_GREEN : (pct >= 50 ? COLOR_YELLOW : COLOR_RED));
         snprintf(number, sizeof number, "%d%%", pct);
-        if (attempts) DrawText(number, (int)track.x + 232, (int)track.y - 3, 20, COLOR_INK);
+        if (attempts) DrawText(number, (int)track.x + 232, (int)track.y - 3, 20, COLOR_TXT);
         else DrawText("not played", (int)track.x + 232, (int)track.y - 1, 16, COLOR_GRAY);
         if (weak) {
             char weakText[24];
@@ -1680,7 +1844,7 @@ static void DrawReviewOverview(Rectangle panel) {
         for (int s = 0; s < 3; s++) {
             Vector2 sc = V2(row.x + 392 + s * 28, row.y + 31);
             DrawStarShape(sc, 14, 0, COLOR_INK);
-            DrawStarShape(sc, 11, 0, s < best ? COLOR_YELLOW : (Color){210, 195, 230, 255});
+            DrawStarShape(sc, 11, 0, s < best ? COLOR_YELLOW : (Color){60, 64, 110, 255});
         }
         bool open = IsLevelUnlocked(app.mode, l);
         if (DrawCandyButton((Rectangle){ row.x + 474, row.y + 9, 82, 50 }, open ? "PLAY" : "LOCK", COLOR_GREEN, open, 18)) StartLevel(l);
@@ -1690,12 +1854,12 @@ static void DrawReviewOverview(Rectangle panel) {
 static void ScreenReview(void) {
     DrawBackground(0.18f);
     DrawHeaderBar("MY PROGRESS", 122, true);
-    if (DrawCandyButton((Rectangle){ 12, 8, 100, 44 }, "BACK", COLOR_PINK, true, 20) || IsKeyPressed(KEY_ESCAPE)) { SetScreen(SCREEN_MAP); return; }
+    if (DrawCandyButton((Rectangle){ 12, 8, 100, 44 }, "BACK", COLOR_ORANGE, true, 20) || IsKeyPressed(KEY_ESCAPE)) { SetScreen(SCREEN_MAP); return; }
 
     const char *tabNames[3] = { "OVERVIEW", "WEAK SPOTS", "LAST RUN" };
     for (int tab = 0; tab < 3; tab++) {
         Rectangle r = { 30 + tab * 200.0f, 86, 190, 52 };
-        if (DrawCandyButton(r, tabNames[tab], tab == app.reviewTab ? COLOR_PINK : COLOR_PURPLE, true, 22) && tab != app.reviewTab) { app.reviewTab = tab; BuildReviewList(tab); }
+        if (DrawCandyButton(r, tabNames[tab], tab == app.reviewTab ? COLOR_CYAN : COLOR_PURPLE, true, 22) && tab != app.reviewTab) { app.reviewTab = tab; BuildReviewList(tab); }
     }
     Rectangle panel = { 30, 148, 940, 406 };
     DrawRoundOutlined(panel, 26, 5, COLOR_CREAM, COLOR_INK);
@@ -1704,10 +1868,10 @@ static void ScreenReview(void) {
         DrawReviewOverview(panel);
     } else {
         if (app.reviewCount == 0) {
-            DrawTextCentered(app.reviewTab == 1 ? "No weak spots yet!" : "Nothing to review yet!", 500, 300, 32, COLOR_INK);
-            DrawTextCentered(app.reviewTab == 1 ? "Keep playing - I will flag anything tricky here." : "Finish a level and its answers show up here.", 500, 346, 20, (Color){120, 90, 160, 255});
+            DrawTextCentered(app.reviewTab == 1 ? "No weak spots yet!" : "Nothing to review yet!", 500, 300, 32, COLOR_TXT);
+            DrawTextCentered(app.reviewTab == 1 ? "Keep playing - I will flag anything tricky here." : "Finish a level and its answers show up here.", 500, 346, 20, COLOR_DIM);
         } else {
-            DrawText(app.reviewTab == 1 ? "Tricky questions first. Tap one to see the answer and why." : "Tap a question to see the answer and why.", (int)panel.x + 28, (int)panel.y + 14, 18, (Color){120, 90, 160, 255});
+            DrawText(app.reviewTab == 1 ? "Tricky questions first. Tap one to see the answer and why." : "Tap a question to see the answer and why.", (int)panel.x + 28, (int)panel.y + 14, 18, COLOR_DIM);
             Rectangle view = { panel.x + 20, panel.y + 44, panel.width - 40, panel.height - 56 };
             float total = 0;
             for (int i = 0; i < app.reviewCount; i++) {
@@ -1727,7 +1891,7 @@ static void ScreenReview(void) {
                 int detailH = expanded ? DrawQuestionDetail(q, 0, 0, (int)view.width - 60, false) + 16 : 0;
                 Rectangle head = { view.x + 4, y, view.width - 14, 62 };
                 Rectangle whole = { head.x, head.y, head.width, head.height + detailH };
-                DrawRoundOutlined(whole, 18, 3, WHITE, expanded ? LevelColor(q->levelIndex) : (Color){228, 206, 240, 255});
+                DrawRoundOutlined(whole, 18, 3, (Color){18, 16, 52, 255}, expanded ? LevelColor(q->levelIndex) : (Color){62, 56, 128, 255});
                 QStatus status = app.reviewStatus[i];
                 DrawCircleV(V2(head.x + 34, head.y + 31), 20, COLOR_INK);
                 DrawCircleV(V2(head.x + 34, head.y + 31), 17, app.reviewTab == 2 ? StatusColor(status) : LevelColor(q->levelIndex));
@@ -1737,12 +1901,12 @@ static void ScreenReview(void) {
                 DrawTextCentered(tag, (int)head.x + 34, (int)head.y + 22, 18, COLOR_INK);
                 char fitted[200];
                 FitText(q->prompt, fitted, sizeof fitted, app.reviewTab == 1 ? 480 : 600, 20);
-                DrawText(fitted, (int)head.x + 66, (int)head.y + 8, 20, COLOR_INK);
+                DrawText(fitted, (int)head.x + 66, (int)head.y + 8, 20, COLOR_TXT);
                 if (q->snippet[0] && !expanded) {
                     FitText(q->snippet, fitted, sizeof fitted, 480, 16);
-                    DrawText(fitted, (int)head.x + 66, (int)head.y + 36, 16, (Color){40, 150, 80, 255});
+                    DrawText(fitted, (int)head.x + 66, (int)head.y + 36, 16, COLOR_GREEN);
                 } else if (!q->snippet[0] && !expanded) {
-                    DrawText(levelNames[q->levelIndex], (int)head.x + 66, (int)head.y + 36, 16, (Color){120, 90, 160, 255});
+                    DrawText(levelNames[q->levelIndex], (int)head.x + 66, (int)head.y + 36, 16, COLOR_DIM);
                 }
                 if (app.reviewTab == 1) {
                     DrawCountBadge(head.x + head.width - 150, head.y + 31, stat.wrong, COLOR_RED);
@@ -1755,7 +1919,7 @@ static void ScreenReview(void) {
                     DrawTextCentered(label, (int)(chip.x + chip.width / 2), (int)chip.y + 7, 16, COLOR_INK);
                 }
                 if (expanded) {
-                    DrawLineEx(V2(head.x + 20, head.y + 64), V2(head.x + head.width - 20, head.y + 64), 2, (Color){228, 206, 240, 255});
+                    DrawLineEx(V2(head.x + 20, head.y + 64), V2(head.x + head.width - 20, head.y + 64), 2, (Color){62, 56, 128, 255});
                     DrawQuestionDetail(q, (int)head.x + 30, (int)head.y + 74, (int)view.width - 60, true);
                 }
                 bool inView = CheckCollisionPointRec(GetMousePosition(), view);
@@ -1785,6 +1949,7 @@ static void InitApp(void) {
     for (int i = 0; i < SPARKLE_COUNT; i++) sparklePos[i] = V2((float)GetRandomValue(0, WINDOW_WIDTH), (float)GetRandomValue(0, WINDOW_HEIGHT));
     memset(&app, 0, sizeof app);
     app.selectedLevel = -1;
+    app.pendingHop = app.hopFrom = app.hopTo = app.unlockLevel = app.autoOpenLevel = -1;
     LoadProgress();
 }
 
@@ -1805,7 +1970,18 @@ static void FrameUpdate(void) {
         case SCREEN_REVIEW:   ScreenReview();   break;
     }
     DrawEffects();
-    if (app.screenTime < 0.25f) DrawRectangle(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT, Fade(COLOR_INK, 1.0f - app.screenTime / 0.25f));
+    for (int y = 0; y < WINDOW_HEIGHT; y += 3) DrawRectangle(0, y, WINDOW_WIDTH, 1, Fade(BLACK, 0.2f));   // CRT scanlines
+    if (app.screenTime < 0.55f) {   // "blinds" wipe between screens
+        const int slats = 14;
+        float width = WINDOW_WIDTH / (float)slats;
+        for (int i = 0; i < slats; i++) {
+            float p = Smooth((app.screenTime - i * 0.025f) / 0.3f);
+            float h = WINDOW_HEIGHT * (1.0f - p);
+            if (h < 1) continue;
+            DrawRectangle((int)(i * width), 0, (int)width + 1, (int)h, (Color){4, 2, 22, 255});
+            DrawRectangle((int)(i * width), (int)h - 3, (int)width + 1, 3, COLOR_CYAN);
+        }
+    }
     EndDrawing();
     SetMouseCursor(wantHand ? MOUSE_CURSOR_POINTING_HAND : MOUSE_CURSOR_DEFAULT);
 }
