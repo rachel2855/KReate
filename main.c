@@ -231,13 +231,290 @@ static Color LevelColor(int level) {
 }
 static const Question *QuestionAt(int bankIndex) { return &questionBank[bankIndex]; }
 
-static void SetScreen(ScreenState screen) { app.screen = screen; app.screenTime = 0; }
+// ================================================================ audio
+// Every sound effect and the background loop are synthesised in code when the app starts,
+// so there are no asset files to ship. If no audio device exists the app just stays silent.
+#define SAMPLE_RATE 22050
+typedef enum { FX_CLICK, FX_CORRECT, FX_WRONG, FX_UNLOCK, FX_FANFARE, FX_FAIL, FX_HOP, FX_WHOOSH, FX_POP, FX_STAR, FX_TICK, FX_BLIP, FX_COUNT } FxId;
+static Sound fxSounds[FX_COUNT];
+static Music musicStream;
+static unsigned char *musicFile;
+static bool audioReady, musicReady, soundOn = true;
+static float musicLevel;
+
+static float *SynthNew(float seconds, int *count) { *count = (int)(seconds * SAMPLE_RATE); return (float *)calloc((size_t)*count, sizeof(float)); }
+
+static float SynthOsc(int shape, float cycles) {
+    float p = cycles - floorf(cycles);
+    switch (shape) {
+        case 0:  return sinf(2 * PI * p);
+        case 1:  return p < 0.5f ? 1.0f : -1.0f;
+        case 2:  return 2 * p - 1;
+        default: return 4 * fabsf(p - 0.5f) - 1;   // triangle
+    }
+}
+
+// Adds one note. Positions wrap round the buffer so looping tails stay seamless.
+static void SynthTone(float *buf, int count, float start, float dur, float f0, float f1, int shape, float vol, float attack, float release, float decay) {
+    int first = (int)(start * SAMPLE_RATE), length = (int)(dur * SAMPLE_RATE);
+    float phase = 0;
+    for (int i = 0; i < length; i++) {
+        float t = (float)i / SAMPLE_RATE;
+        phase += (f0 + (f1 - f0) * ((float)i / (float)length)) / SAMPLE_RATE;
+        float env = (attack > 0 && t < attack ? t / attack : 1.0f) * (release > 0 && dur - t < release ? (dur - t) / release : 1.0f) * expf(-decay * t);
+        buf[(first + i) % count] += SynthOsc(shape, phase) * vol * env;
+    }
+}
+
+static unsigned int synthSeed = 12345u;
+static float SynthRand(void) { synthSeed = synthSeed * 1664525u + 1013904223u; return ((synthSeed >> 8) & 0xFFFF) / 32768.0f - 1.0f; }
+
+static void SynthNoise(float *buf, int count, float start, float dur, float vol, float decay, bool highpass) {
+    int first = (int)(start * SAMPLE_RATE), length = (int)(dur * SAMPLE_RATE);
+    float z = 0;
+    for (int i = 0; i < length; i++) {
+        float n = SynthRand(), t = (float)i / SAMPLE_RATE;
+        z += 0.35f * (n - z);
+        buf[(first + i) % count] += (highpass ? n - z : z) * vol * expf(-decay * t);
+    }
+}
+
+// Rising "swoosh": noise whose brightness sweeps up while its volume swells and fades.
+static void SynthWhoosh(float *buf, int count, float dur, float vol) {
+    int length = (int)(dur * SAMPLE_RATE);
+    float z = 0;
+    for (int i = 0; i < length && i < count; i++) {
+        float f = (float)i / (float)length, s = sinf(PI * f);
+        z += (0.04f + 0.5f * f) * (SynthRand() - z);
+        buf[i] += z * vol * s * s;
+    }
+}
+
+static void SynthLowpass(float *buf, int count, float alpha) {
+    float z = 0;
+    for (int i = 0; i < count; i++) { z += alpha * (buf[i] - z); buf[i] = z; }
+}
+
+static void SynthEcho(float *buf, int count, float delay, float gain) {
+    int d = (int)(delay * SAMPLE_RATE);
+    for (int i = count - 1; i >= d; i--) buf[i] += buf[i - d] * gain;
+}
+
+static void SynthNormalize(float *buf, int count, float peak) {
+    float m = 0;
+    for (int i = 0; i < count; i++) if (fabsf(buf[i]) > m) m = fabsf(buf[i]);
+    if (m > 0) for (int i = 0; i < count; i++) buf[i] *= peak / m;
+}
+
+static float *SynthFx(FxId id, int *count) {
+    float *b = NULL;
+    float peak = 0.5f;
+    switch (id) {
+        case FX_CLICK:
+            b = SynthNew(0.12f, count);
+            SynthTone(b, *count, 0, 0.06f, 1100, 1500, 1, 0.6f, 0, 0.01f, 40);
+            peak = 0.26f;
+            break;
+        case FX_CORRECT: {
+            static const float notes[4] = { 1046.5f, 1318.5f, 1568.0f, 2093.0f };
+            b = SynthNew(0.9f, count);
+            for (int i = 0; i < 4; i++) {
+                SynthTone(b, *count, i * 0.07f, 0.35f, notes[i], notes[i], 3, 0.6f, 0.003f, 0.05f, 9);
+                SynthTone(b, *count, i * 0.07f, 0.35f, notes[i] * 2, notes[i] * 2, 0, 0.15f, 0.003f, 0.05f, 12);
+            }
+            peak = 0.5f;
+        } break;
+        case FX_WRONG:
+            b = SynthNew(0.7f, count);
+            SynthTone(b, *count, 0, 0.22f, 196, 150, 2, 0.6f, 0.005f, 0.05f, 5);
+            SynthTone(b, *count, 0.13f, 0.35f, 147, 104, 2, 0.6f, 0.005f, 0.1f, 4);
+            SynthLowpass(b, *count, 0.18f);
+            peak = 0.5f;
+            break;
+        case FX_UNLOCK: {
+            static const float notes[6] = { 523.25f, 659.25f, 783.99f, 1046.5f, 1318.5f, 1568.0f };
+            b = SynthNew(2.0f, count);
+            for (int i = 0; i < 6; i++) {
+                SynthTone(b, *count, i * 0.085f, 0.5f, notes[i], notes[i], 3, 0.5f, 0.004f, 0.1f, 6);
+                SynthTone(b, *count, i * 0.085f, 0.5f, notes[i] * 2, notes[i] * 2, 0, 0.12f, 0.004f, 0.1f, 8);
+            }
+            SynthTone(b, *count, 0.55f, 1.0f, 1046.5f, 1046.5f, 3, 0.25f, 0.01f, 0.6f, 1.5f);
+            SynthTone(b, *count, 0.55f, 1.0f, 1318.5f, 1318.5f, 3, 0.2f, 0.01f, 0.6f, 1.5f);
+            SynthTone(b, *count, 0.55f, 1.0f, 1568.0f, 1568.0f, 3, 0.2f, 0.01f, 0.6f, 1.5f);
+            SynthEcho(b, *count, 0.2f, 0.35f);
+            peak = 0.5f;
+        } break;
+        case FX_FANFARE: {
+            static const float notes[4] = { 783.99f, 1046.5f, 1318.5f, 1568.0f };
+            static const float chord[4] = { 523.25f, 659.25f, 783.99f, 1046.5f };
+            b = SynthNew(2.1f, count);
+            for (int i = 0; i < 4; i++) {
+                SynthTone(b, *count, i * 0.11f, 0.3f, notes[i], notes[i], 1, 0.22f, 0.003f, 0.05f, 7);
+                SynthTone(b, *count, i * 0.11f, 0.3f, notes[i], notes[i], 3, 0.4f, 0.003f, 0.05f, 7);
+            }
+            for (int i = 0; i < 4; i++) SynthTone(b, *count, 0.5f, 1.2f, chord[i] * 2, chord[i] * 2, 3, 0.2f, 0.01f, 0.6f, 1.2f);
+            SynthEcho(b, *count, 0.22f, 0.3f);
+            peak = 0.5f;
+        } break;
+        case FX_FAIL: {
+            static const float notes[3] = { 440.0f, 349.23f, 293.66f };
+            b = SynthNew(1.4f, count);
+            for (int i = 0; i < 3; i++) SynthTone(b, *count, i * 0.24f, 0.5f, notes[i], notes[i] * 0.97f, 3, 0.6f, 0.01f, 0.2f, 3);
+            SynthTone(b, *count, 0.72f, 0.6f, 220, 190, 2, 0.3f, 0.01f, 0.3f, 3);
+            SynthLowpass(b, *count, 0.35f);
+            peak = 0.45f;
+        } break;
+        case FX_HOP:
+            b = SynthNew(0.2f, count);
+            SynthTone(b, *count, 0, 0.12f, 280, 640, 0, 0.8f, 0.003f, 0.02f, 14);
+            peak = 0.38f;
+            break;
+        case FX_WHOOSH:
+            b = SynthNew(0.5f, count);
+            SynthWhoosh(b, *count, 0.45f, 1.0f);
+            peak = 0.22f;
+            break;
+        case FX_POP:
+            b = SynthNew(0.25f, count);
+            SynthTone(b, *count, 0, 0.1f, 420, 980, 0, 0.8f, 0.002f, 0.02f, 12);
+            peak = 0.38f;
+            break;
+        case FX_STAR:
+            b = SynthNew(0.7f, count);
+            SynthTone(b, *count, 0, 0.55f, 1318.5f, 1318.5f, 0, 0.6f, 0.003f, 0.1f, 7);
+            SynthTone(b, *count, 0, 0.55f, 2637.0f, 2637.0f, 0, 0.25f, 0.003f, 0.1f, 10);
+            peak = 0.42f;
+            break;
+        case FX_TICK:
+            b = SynthNew(0.05f, count);
+            SynthTone(b, *count, 0, 0.02f, 2000, 2000, 1, 0.6f, 0, 0.005f, 100);
+            peak = 0.16f;
+            break;
+        default:
+            b = SynthNew(0.15f, count);
+            SynthTone(b, *count, 0, 0.08f, 1800, 2300, 0, 0.8f, 0.002f, 0.01f, 25);
+            peak = 0.32f;
+            break;
+    }
+    SynthNormalize(b, *count, peak);
+    return b;
+}
+
+// Calm, techy loop: soft pad chords (Am - F - C - G), a plucked arpeggio with echo,
+// a sparse bell melody, a deep bass and a very light kick and hi-hat. 8 bars at 100 BPM.
+static float *SynthMusic(int *count) {
+    const float beat = 0.6f;
+    const int bars = 8;
+    static const float chords[4][3] = { { 220.0f, 261.63f, 329.63f }, { 174.61f, 220.0f, 261.63f }, { 261.63f, 329.63f, 392.0f }, { 196.0f, 246.94f, 293.66f } };
+    static const float bass[4] = { 110.0f, 87.31f, 130.81f, 98.0f };
+    static const int arpPattern[8] = { 0, 1, 2, 1, 0, 2, 1, 2 };
+    static const float pentatonic[5] = { 440.0f, 523.25f, 587.33f, 659.25f, 783.99f };
+    static const int bells[12][2] = { { 6, 3 }, { 10, 4 }, { 14, 2 }, { 22, 1 }, { 26, 3 }, { 30, 2 }, { 38, 4 }, { 42, 3 }, { 46, 0 }, { 54, 2 }, { 58, 3 }, { 62, 1 } };
+    float *mix = SynthNew(bars * 4 * beat, count);
+    int n = *count;
+    float *arp = (float *)calloc((size_t)n, sizeof(float));
+    for (int c = 0; c < 4; c++) {
+        float start = c * 8 * beat;
+        for (int k = 0; k < 3; k++) {
+            SynthTone(mix, n, start, 8 * beat + 0.8f, chords[c][k], chords[c][k], 3, 0.055f, 0.7f, 0.8f, 0);
+            SynthTone(mix, n, start, 8 * beat + 0.8f, chords[c][k] * 1.004f, chords[c][k] * 1.004f, 0, 0.035f, 0.7f, 0.8f, 0);
+        }
+        SynthTone(mix, n, start, 8 * beat + 0.8f, bass[c], bass[c], 0, 0.07f, 0.7f, 0.8f, 0);
+    }
+    for (int bar = 0; bar < bars; bar++) {
+        int c = bar / 2;
+        for (int hit = 0; hit < 2; hit++) SynthTone(mix, n, (bar * 4 + hit * 2) * beat, 0.6f, bass[c], bass[c], 0, 0.22f, 0.01f, 0.25f, 3.5f);
+        SynthTone(mix, n, bar * 4 * beat, 0.22f, 130, 45, 0, 0.16f, 0, 0.06f, 12);
+    }
+    for (int step = 1; step < bars * 8; step += 2) SynthNoise(mix, n, step * beat / 2, 0.05f, 0.05f, 70, true);
+    for (int step = 0; step < bars * 8; step++) {
+        float f = chords[step / 16][arpPattern[step % 8]] * 2;
+        SynthTone(arp, n, step * beat / 2, 0.4f, f, f, 3, 0.09f, 0.004f, 0.05f, 6);
+        SynthTone(arp, n, step * beat / 2, 0.4f, f, f, 1, 0.025f, 0.004f, 0.05f, 9);
+    }
+    for (int i = 0; i < 12; i++) {
+        float f = pentatonic[bells[i][1]], start = bells[i][0] * beat / 2;
+        SynthTone(arp, n, start, 1.4f, f, f, 0, 0.09f, 0.004f, 0.3f, 2.6f);
+        SynthTone(arp, n, start, 1.4f, f * 2, f * 2, 0, 0.03f, 0.004f, 0.3f, 4.0f);
+    }
+    int d = (int)(0.45f * SAMPLE_RATE);
+    for (int i = 0; i < n; i++) {
+        mix[i] += arp[i];
+        mix[(i + d) % n] += arp[i] * 0.38f;
+        mix[(i + 2 * d) % n] += arp[i] * 0.18f;
+    }
+    free(arp);
+    SynthNormalize(mix, n, 0.85f);
+    return mix;
+}
+
+static unsigned char *SynthWavFile(const float *buf, int count, int *fileSize) {
+    int dataSize = count * 2;
+    *fileSize = 44 + dataSize;
+    unsigned char *file = (unsigned char *)malloc((size_t)*fileSize);
+    unsigned int values[10] = { 0x46464952u, (unsigned int)(36 + dataSize), 0x45564157u, 0x20746d66u, 16u, 0x00010001u, SAMPLE_RATE, SAMPLE_RATE * 2u, 0x00100002u, 0x61746164u };
+    memcpy(file, values, 40);
+    memcpy(file + 40, &dataSize, 4);
+    short *samples = (short *)(file + 44);
+    for (int i = 0; i < count; i++) samples[i] = (short)(fmaxf(-1.0f, fminf(1.0f, buf[i])) * 32767.0f);
+    return file;
+}
+
+static void InitAudio(void) {
+    InitAudioDevice();
+    audioReady = IsAudioDeviceReady();
+    if (!audioReady) return;
+    for (int id = 0; id < FX_COUNT; id++) {
+        int count;
+        float *buf = SynthFx((FxId)id, &count);
+        Wave wave = { 0 };
+        wave.frameCount = (unsigned int)count;
+        wave.sampleRate = SAMPLE_RATE;
+        wave.sampleSize = 16;
+        wave.channels = 1;
+        wave.data = MemAlloc((unsigned int)count * 2);
+        short *samples = (short *)wave.data;
+        for (int i = 0; i < count; i++) samples[i] = (short)(fmaxf(-1.0f, fminf(1.0f, buf[i])) * 32767.0f);
+        fxSounds[id] = LoadSoundFromWave(wave);
+        UnloadWave(wave);
+        free(buf);
+        SetSoundVolume(fxSounds[id], 0.9f);
+    }
+    int count, size;
+    float *music = SynthMusic(&count);
+    musicFile = SynthWavFile(music, count, &size);
+    free(music);
+    musicStream = LoadMusicStreamFromMemory(".wav", musicFile, size);
+    musicReady = IsMusicValid(musicStream);
+    if (musicReady) { musicStream.looping = true; SetMusicVolume(musicStream, 0); PlayMusicStream(musicStream); }
+}
+
+static void ShutdownAudio(void) {
+    if (!audioReady) return;
+    if (musicReady) UnloadMusicStream(musicStream);
+    for (int id = 0; id < FX_COUNT; id++) UnloadSound(fxSounds[id]);
+    free(musicFile);
+    CloseAudioDevice();
+}
+
+static void PlayFx(FxId id) { if (audioReady && soundOn) PlaySound(fxSounds[id]); }
+
+// Music is loudest when you are idle (title, modes, map, reports) and fades away while answering.
+static void UpdateAudio(float dt, bool quiet) {
+    if (!audioReady || !musicReady) return;
+    float target = (soundOn && !quiet) ? 1.0f : 0.0f;
+    musicLevel += (target - musicLevel) * (dt * 2.5f > 1 ? 1 : dt * 2.5f);
+    SetMusicVolume(musicStream, musicLevel * 0.45f);
+    UpdateMusicStream(musicStream);
+}
+
+static void SetScreen(ScreenState screen) { app.screen = screen; app.screenTime = 0; PlayFx(FX_WHOOSH); }
 static void ShowToast(const char *text) { snprintf(app.toast, sizeof app.toast, "%s", text); app.toastTime = 2.4f; }
 
 // A click is "used up" by the first widget that takes it, so overlapping widgets never both fire.
 static bool TakeClick(bool hovered) {
     if (hovered) wantHand = true;
-    if (hovered && !clickConsumed && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) { clickConsumed = true; return true; }
+    if (hovered && !clickConsumed && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) { clickConsumed = true; PlayFx(FX_CLICK); return true; }
     return false;
 }
 static bool HoverRect(Rectangle r) { return !uiLocked && CheckCollisionPointRec(GetMousePosition(), r); }
@@ -587,6 +864,7 @@ static void DrawBot(float cx, float footY, float s, BotMood mood) {
     float bob = sinf(t * 3.0f) * 2.5f * s;
     if (mood == MOOD_CHEER) bob = -fabsf(sinf(t * 7.0f)) * 12.0f * s;
     if (mood == MOOD_SAD) bob = sinf(t * 1.6f) * 1.0f * s;
+    if (mood == MOOD_HAPPY) { float ph = fmodf(t + s, 8.0f); if (ph < 0.7f) bob -= sinf(ph / 0.7f * PI) * 14.0f * s; }   // little idle hop
     Color white = { 222, 232, 252, 255 }, shade = { 150, 168, 214, 255 };
     Color headCol = { 170, 238, 255, 255 }, glow = { 126, 255, 250, 255 };
     float y0 = footY + bob;
@@ -918,6 +1196,8 @@ static void FinishSession(void) {
     for (int i = 0; i < app.questionCount; i++) { app.lastRunIds[i] = app.questionIds[i]; app.lastRunStatus[i] = app.qStatus[i]; }
     SaveProgress();
     SetScreen(SCREEN_RESULTS);
+    bool passed = app.levelIndex < 0 ? app.correctCount * 2 >= app.questionCount : app.levelGems > 0;
+    PlayFx(passed ? FX_FANFARE : FX_FAIL);
     if (app.levelGems > 0) SpawnConfetti(60);
 }
 
@@ -975,6 +1255,7 @@ static void SubmitAnswer(const Question *question, bool correct, const char *det
         snprintf(app.feedbackText, sizeof app.feedbackText, "Have another go, or peek at the answer.\nHint: %s", question->hint);
         snprintf(app.revealText, sizeof app.revealText, "%s\n%s", detail, question->explanation);
     }
+    PlayFx(correct ? FX_CORRECT : FX_WRONG);
     SaveProgress();
     OpenSheet();
 }
@@ -1009,7 +1290,7 @@ static bool KeyRepeat(int key) { return IsKeyPressed(key) || IsKeyPressedRepeat(
 
 static void HandleTextInput(char *buffer, int *length, int capacity) {
     for (int key = GetCharPressed(); key > 0; key = GetCharPressed())
-        if (key >= 32 && key <= 126 && *length < capacity - 1) { buffer[(*length)++] = (char)key; buffer[*length] = '\0'; }
+        if (key >= 32 && key <= 126 && *length < capacity - 1) { buffer[(*length)++] = (char)key; buffer[*length] = '\0'; PlayFx(FX_TICK); }
     if (KeyRepeat(KEY_BACKSPACE) && *length > 0) buffer[--(*length)] = '\0';
 }
 
@@ -1025,7 +1306,7 @@ static int CodeLineEnd(int pos) { while (app.codeAnswer[pos] && app.codeAnswer[p
 
 // A tiny code editor: cursor, arrows, auto-indent, tab = 4 spaces.
 static void HandleCodeInput(void) {
-    for (int key = GetCharPressed(); key > 0; key = GetCharPressed()) if (key >= 32 && key <= 126) CodeInsert((char)key);
+    for (int key = GetCharPressed(); key > 0; key = GetCharPressed()) if (key >= 32 && key <= 126) { CodeInsert((char)key); PlayFx(FX_TICK); }
     if (KeyRepeat(KEY_BACKSPACE) && app.codeCursor > 0) {
         memmove(app.codeAnswer + app.codeCursor - 1, app.codeAnswer + app.codeCursor, (size_t)(app.codeLength - app.codeCursor + 1));
         app.codeCursor--; app.codeLength--;
@@ -1086,11 +1367,59 @@ static bool RunCodeChallenge(const Question *question, char *detail, int detailS
 
 
 // ================================================================ screens
+static bool titleSeen;
+static float titleBootShift, titleLeave = -1.0f;
+
 static void ScreenTitle(void) {
-    float t = (float)GetTime();
+    float t = (float)GetTime(), dt = GetFrameTime();
+    float e = app.screenTime + (titleSeen ? 1.9f : titleBootShift);   // first launch plays a short boot sequence
+    bool skip = IsMouseButtonPressed(MOUSE_BUTTON_LEFT) || IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_SPACE);
+    if (e < 1.9f && skip) { titleBootShift += 1.9f - e; e = 1.9f; }
+    static float prevE;
+    if (prevE < 1.9f && e >= 1.9f) { PlayFx(FX_WHOOSH); PlayFx(FX_POP); }
+    prevE = e;
+
+    if (e < 1.9f) {   // ---- boot terminal
+        DrawBackground(0.55f);
+        Rectangle box = { 240, 250, 520, 190 };
+        DrawRoundOutlined(box, 16, 3, COLOR_CREAM, COLOR_INK);
+        static const char *lines[3] = { "> BOOTING C QUEST v1.0", "> LOADING LEVELS ...", "> WAKING UP BYTE ..." };
+        int typed = 0;
+        for (int i = 0; i < 3; i++) {
+            int length = (int)strlen(lines[i]);
+            int chars = (int)((e - (0.1f + i * 0.5f)) * 40.0f);
+            chars = chars < 0 ? 0 : (chars > length ? length : chars);
+            char text[40];
+            memcpy(text, lines[i], (size_t)chars);
+            text[chars] = '\0';
+            DrawText(text, (int)box.x + 24, (int)box.y + 22 + i * 30, 20, i == 2 ? COLOR_GREEN : COLOR_TXT);
+            typed += chars;
+        }
+        static int prevTyped;
+        if (typed / 3 != prevTyped / 3) PlayFx(FX_TICK);
+        prevTyped = typed;
+        float fill = Smooth(e / 1.7f);
+        Rectangle bar = { box.x + 24, box.y + 124, box.width - 48, 24 };
+        DrawRound(bar, 6, (Color){14, 16, 50, 255});
+        DrawRound((Rectangle){ bar.x + 3, bar.y + 3, (bar.width - 6) * fill, bar.height - 6 }, 4, COLOR_CYAN);
+        for (float x = bar.x + 14; x < bar.x + bar.width; x += 14) DrawRectangle((int)x, (int)bar.y + 3, 2, (int)bar.height - 6, Fade(COLOR_INK, 0.6f));
+        char percent[16];
+        snprintf(percent, sizeof percent, "%d%%", (int)(fill * 100));
+        DrawText(percent, (int)(box.x + box.width - 24) - MeasureText(percent, 18), (int)box.y + 156, 18, COLOR_CYAN);
+        if ((int)(t * 3) % 2 == 0) DrawText("_", (int)box.x + 24, (int)box.y + 156, 18, COLOR_GREEN);
+        DrawBot(500, 232, 0.7f, MOOD_THINK);
+        if (e > 1.75f) DrawRectangle(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT, Fade(WHITE, (e - 1.75f) / 0.15f * 0.8f));
+        return;
+    }
+
+    float a = e - 1.9f;   // seconds since the title revealed itself
+    if (titleLeave >= 0) {
+        titleLeave += dt;
+        if (titleLeave > 0.95f) { titleLeave = -1.0f; titleSeen = true; SetScreen(SCREEN_MODE); return; }
+    }
     DrawBackground(0);
-    DrawCloud(V2(170 + sinf(t * 0.3f) * 20, 150), 1.0f, Fade(WHITE, 0.55f));
-    DrawCloud(V2(840 + sinf(t * 0.25f) * 24, 190), 1.2f, Fade(WHITE, 0.55f));
+    DrawCloud(V2(170 + sinf(t * 0.3f) * 20, 150), 1.0f, Fade(WHITE, 0.6f));
+    DrawCloud(V2(840 + sinf(t * 0.25f) * 24, 190), 1.2f, Fade(WHITE, 0.6f));
     DrawLollipop(V2(95, 455), 32, COLOR_CYAN, COLOR_CREAM, 0.2f);
     DrawLollipop(V2(905, 440), 36, COLOR_YELLOW, COLOR_CREAM, -0.25f);
     DrawCupcake(V2(215, 612), 0.95f);
@@ -1098,14 +1427,18 @@ static void ScreenTitle(void) {
     DrawWrappedCandy(V2(120, 330 + sinf(t * 2) * 8), 18, COLOR_YELLOW, t);
     DrawWrappedCandy(V2(880, 300 + sinf(t * 2 + 1) * 8), 20, COLOR_GREEN, -t);
 
+    // logo letters drop in one by one, then bob gently
     const char *logo = "C QUEST";
     int size = 112, spacing = 6, total = 0;
     for (int i = 0; logo[i]; i++) { char one[2] = { logo[i], 0 }; total += MeasureText(one, size) + spacing; }
     int x = WINDOW_WIDTH / 2 - (total - spacing) / 2;
     for (int i = 0; logo[i]; i++) {
         char one[2] = { logo[i], 0 };
-        int y = 56 + (int)(sinf(t * 3.2f + i * 0.8f) * 9);
-        if (logo[i] != ' ') {
+        float k = Clampf((a - 0.08f * i) / 0.6f, 0, 1);
+        float bob = a > 1.4f ? sinf(t * 3.2f + i * 0.8f) * 9.0f * Smooth((a - 1.4f) / 0.5f) : 0;
+        if (titleLeave >= 0) bob -= fabsf(sinf(titleLeave * 9.0f + i * 0.5f)) * 14.0f;
+        int y = (int)(56 + bob - (1.0f - EaseOutBack(k)) * 340.0f);
+        if (k > 0 && logo[i] != ' ') {
             DrawText(one, x, y + 10, size, Fade(COLOR_INK, 0.55f));
             DrawText(one, x - 4, y, size, Fade(COLOR_CYAN, 0.65f));
             DrawText(one, x + 4, y, size, Fade(COLOR_PURPLE, 0.65f));
@@ -1113,18 +1446,34 @@ static void ScreenTitle(void) {
         }
         x += MeasureText(one, size) + spacing;
     }
-    DrawSparkle(V2(250 + sinf(t * 2) * 6, 70), 14, WHITE);
-    DrawSparkle(V2(760, 92 + sinf(t * 2.4f) * 6), 11, COLOR_YELLOW);
-    DrawSparkle(V2(838, 60), 9, WHITE);
+    if (a > 0.9f) {
+        DrawSparkle(V2(250 + sinf(t * 2) * 6, 70), 14, WHITE);
+        DrawSparkle(V2(760, 92 + sinf(t * 2.4f) * 6), 11, COLOR_YELLOW);
+        DrawSparkle(V2(838, 60), 9, WHITE);
+    }
 
-    Rectangle ribbon = { 290, 206, 420, 50 };
+    Rectangle ribbon = { 290 - (1.0f - Smooth((a - 0.6f) / 0.5f)) * 800.0f, 206, 420, 50 };
     DrawRoundOutlined(ribbon, 25, 4, COLOR_CREAM, COLOR_INK);
-    DrawTextCO("> learn C the retro way", WINDOW_WIDTH / 2, 218, 26, COLOR_GREEN, COLOR_INK);
+    DrawTextCO("> learn C the retro way", (int)(ribbon.x + 210), 218, 26, COLOR_GREEN, COLOR_INK);
 
-    DrawBot(500, 545, 1.7f, MOOD_HAPPY);
-    float pulse = 1.0f + 0.04f * sinf(t * 5);
-    Rectangle play = { 500 - 140 * pulse, 568, 280 * pulse, 62 };
-    if (DrawCandyButton(play, "PLAY", COLOR_GREEN, true, 38) || IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_SPACE)) SetScreen(SCREEN_MODE);
+    // Byte rises from the floor, and hops with joy after PLAY
+    float rise = 1.0f - Smooth((a - 0.3f) / 0.7f);
+    float jump = titleLeave >= 0 ? fabsf(sinf(titleLeave * PI * 2.4f)) * 130.0f * (1.0f - titleLeave / 1.1f) : 0;
+    DrawBot(500, 545 + rise * 230 - jump, 1.7f, titleLeave >= 0 ? MOOD_CHEER : MOOD_HAPPY);
+
+    float popIn = EaseOutBack(Clampf((a - 1.0f) / 0.4f, 0, 1));
+    float pulse = (1.0f + 0.04f * sinf(t * 5)) * popIn;
+    bool ready = a > 1.3f && titleLeave < 0;
+    if (popIn > 0.02f) {
+        Rectangle play = { 500 - 140 * pulse, 568 + (1 - popIn) * 40, 280 * pulse, 62 };
+        bool clicked = DrawCandyButton(play, "PLAY", COLOR_GREEN, ready, 38);
+        if (ready && (clicked || skip)) {
+            titleLeave = 0.0001f;
+            SpawnBurst(V2(500, 400), 46);
+            PlayFx(FX_UNLOCK);
+        }
+    }
+    if (a < 0.2f) DrawRectangle(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT, Fade(WHITE, 0.8f * (1.0f - a / 0.2f)));   // flash after boot
 }
 
 static void DrawModeCard(Rectangle r, int mode, Color accent) {
@@ -1170,11 +1519,15 @@ static void DrawModeCard(Rectangle r, int mode, Color accent) {
 }
 
 static void ScreenMode(void) {
+    float e = app.screenTime;
     DrawBackground(0.15f);
-    DrawModeCard((Rectangle){ 60, 104, 410, 340 }, MODE_MCQ, COLOR_GREEN);
-    DrawModeCard((Rectangle){ 530, 104, 410, 340 }, MODE_TYPED, COLOR_PURPLE);
-    DrawBubble((Rectangle){ 340, 470, 320, 44 }, "How do you want to learn today?", 18, 500);
-    DrawBot(500, 628, 0.8f, MOOD_HAPPY);
+    for (int i = 0; i < 2; i++) {   // cards slide up one after the other
+        float k = EaseOutBack(Clampf((e - 0.1f - i * 0.15f) / 0.55f, 0, 1));
+        if (k <= 0.01f) continue;
+        DrawModeCard((Rectangle){ 60 + i * 470.0f, 104 + (1.0f - k) * 520.0f, 410, 340 }, i, i == 0 ? COLOR_GREEN : COLOR_PURPLE);
+    }
+    if (e > 0.8f) DrawBubble((Rectangle){ 340, 470, 320, 44 }, "How do you want to learn today?", 18, 500);
+    DrawBot(500, 628 + (1.0f - Smooth((e - 0.4f) / 0.5f)) * 150.0f, 0.8f, MOOD_HAPPY);
     DrawHeaderBar("CHOOSE YOUR MODE", 122, true);
     if (DrawCandyButton((Rectangle){ 12, 8, 100, 44 }, "BACK", COLOR_ORANGE, true, 20) || IsKeyPressed(KEY_ESCAPE)) SetScreen(SCREEN_TITLE);
 }
@@ -1225,7 +1578,10 @@ static void DrawLevelNode(Vector2 c, int level, bool locked, bool available, int
     float t = (float)GetTime();
     bool boss = level == LEVEL_COUNT - 1;
     float r = boss ? 50.0f : 40.0f;
+    float pop = EaseOutBack(Clampf((app.screenTime - 0.25f - level * 0.1f) / 0.45f, 0, 1));
+    if (pop < 0.02f) return;
     if (hovered) r *= 1.07f;
+    r *= pop;
     if (level == app.unlockLevel && app.unlockTime < 0.7f) r *= 0.45f + 0.55f * EaseOutBack(app.unlockTime / 0.55f);
     float bounce = isCurrent ? -fabsf(sinf(t * 4.0f)) * 9.0f : 0;
     DrawEllipse((int)c.x, (int)(c.y + r + 4), r * 0.95f, 9, Fade(COLOR_CYAN, 0.22f));
@@ -1238,6 +1594,7 @@ static void DrawLevelNode(Vector2 c, int level, bool locked, bool available, int
     DrawNgon(c, 6, r - 4, 0, COLOR_INK);
     DrawNgon(c, 6, r - 6, 0, Mix(col, locked ? 0.22f : (gems > 0 ? 0.5f : 0.28f)));
     DrawRectangle((int)(c.x - r * 0.45f), (int)(c.y - r * 0.62f), (int)(r * 0.9f), 2, Fade(WHITE, 0.3f));
+    if (pop < 0.9f) return;
     if (boss) { DrawStarShape(V2(c.x, c.y - r - 16), 17, 0, COLOR_INK); DrawStarShape(V2(c.x, c.y - r - 16), 13, 0, locked ? COLOR_GRAY : COLOR_YELLOW); }
     if (locked) {
         DrawPadlock(V2(c.x, c.y + 2), boss ? 1.5f : 1.25f, COLOR_GRAY);
@@ -1293,12 +1650,16 @@ static void ScreenMap(void) {
     if (app.pendingHop >= 0 && app.hopTo < 0) { app.hopFrom = app.pendingHop; app.hopTo = app.hopFrom + 1; app.hopTime = -0.7f; app.pendingHop = -1; }
     if (app.hopTo >= 0) {
         app.hopTime += dt;
-        if (app.hopTime >= 1.5f) { SpawnBurst(nodePos[app.hopTo], 60); app.unlockLevel = app.hopTo; app.unlockTime = 0; app.hopTo = -1; }
+        static int lastStep;
+        int step = app.hopTime > 0 ? (int)(Clampf(app.hopTime / 1.5f, 0, 1) * 4) : 0;
+        if (step != lastStep && step > 0 && step < 4) PlayFx(FX_HOP);
+        lastStep = step;
+        if (app.hopTime >= 1.5f) { PlayFx(FX_UNLOCK); SpawnBurst(nodePos[app.hopTo], 60); app.unlockLevel = app.hopTo; app.unlockTime = 0; app.hopTo = -1; }
     }
     if (app.unlockLevel >= 0) { app.unlockTime += dt; if (app.unlockTime > 2.4f) app.unlockLevel = -1; }
     if (app.selectedLevel >= 0) app.popupTime += dt;
     if (app.autoOpenLevel >= 0 && app.hopTo < 0 && app.pendingHop < 0 && app.screenTime > 0.6f && (app.unlockLevel < 0 || app.unlockTime > 1.2f)) {
-        if (IsLevelUnlocked(app.mode, app.autoOpenLevel)) { app.selectedLevel = app.autoOpenLevel; app.popupTime = 0; }
+        if (IsLevelUnlocked(app.mode, app.autoOpenLevel)) { app.selectedLevel = app.autoOpenLevel; app.popupTime = 0; PlayFx(FX_POP); }
         app.autoOpenLevel = -1;
     }
 
@@ -1326,7 +1687,7 @@ static void ScreenMap(void) {
         if (TakeClick(hovered)) {
             if (!available) ShowToast("Switch to TYPED mode to enter the Function Lab!");
             else if (!unlocked) { char msg[64]; snprintf(msg, sizeof msg, "Earn a star on level %d first!", level); ShowToast(msg); }
-            else { app.selectedLevel = level; app.popupTime = 0; }
+            else { app.selectedLevel = level; app.popupTime = 0; PlayFx(FX_POP); }
         }
     }
     if (app.unlockLevel >= 0 && app.unlockTime < 1.0f) {
@@ -1400,7 +1761,7 @@ static void DrawQuestionPips(void) {
         Vector2 c = V2(startX + i * spacing, 29);
         bool isCurrent = i == app.current;
         bool hovered = !uiLocked && CheckCollisionPointCircle(GetMousePosition(), c, 17);
-        float r = (isCurrent ? 16.0f : 13.0f) + (hovered ? 2 : 0);
+        float r = (isCurrent ? 16.0f + sinf((float)GetTime() * 5) * 1.2f : 13.0f) + (hovered ? 2 : 0);
         if (isCurrent) DrawRing(c, r + 4, r + 7, 0, 360, 30, Fade(WHITE, 0.8f));
         DrawCircleV(c, r + 3, COLOR_INK);
         DrawCircleV(c, r, StatusColor(app.qStatus[i]));
@@ -1516,6 +1877,7 @@ static void ScreenQuestion(void) {
         int chosen = -1;
         for (int option = 0; option < 4; option++) {
             Rectangle r = { (float)x, (float)(contentY + option * 58), (float)width, 50 };
+            r.x += (1.0f - Smooth((app.qTime - 0.12f - option * 0.07f) / 0.28f)) * 160.0f;   // answers slide in one by one
             Color fill = option == 3 ? COLOR_ORANGE : CandyColor(option);
             bool grey = app.eliminated[option];
             if (app.sheetOpen) {
@@ -1622,7 +1984,7 @@ static void ScreenQuestion(void) {
 
     if (DrawCandyButton((Rectangle){ 30, 572, 125, 54 }, "BACK", COLOR_PURPLE, app.current > 0, 22)) GoToQuestion(app.current - 1);
     bool hintClicked = DrawCandyButton((Rectangle){ 170, 572, 125, 54 }, "HINT", COLOR_ORANGE, !app.qHint[app.current], 22);
-    if ((hintClicked || (!blocked && IsKeyPressed(KEY_F1))) && !app.qHint[app.current]) app.qHint[app.current] = true;
+    if ((hintClicked || (!blocked && IsKeyPressed(KEY_F1))) && !app.qHint[app.current]) { app.qHint[app.current] = true; SpawnBurst(V2(880, 140), 14); PlayFx(FX_BLIP); }
     bool others = NextUnresolved(app.current) >= 0;
     const char *skipLabel = !others ? "FINISH" : (IsResolved(app.qStatus[app.current]) ? "NEXT" : "SKIP");
     if (DrawCandyButton((Rectangle){ 310, 572, 150, 54 }, skipLabel, others ? COLOR_CYAN : COLOR_GREEN, true, 22)) SkipOrNext();
@@ -1674,6 +2036,13 @@ static void ScreenResults(void) {
     bool pass = practice ? app.correctCount * 2 >= app.questionCount : app.levelGems > 0;
     DrawBackground(0.1f);
     if (pass && t < 2.0f && (int)(t * 60) % 4 == 0) SpawnConfetti(2);
+    static float prevT;
+    if (t < prevT) prevT = 0;
+    for (int i = 0; i < app.levelGems && !practice; i++) {
+        float when = 0.3f + i * 0.35f + 0.17f;
+        if (prevT < when && t >= when) { SetSoundPitch(fxSounds[FX_STAR], 1.0f + i * 0.26f); PlayFx(FX_STAR); }
+    }
+    prevT = t;
 
     Rectangle card = { 250, 112, 500, 450 };
     DrawRound((Rectangle){ card.x + 4, card.y + 12, card.width, card.height }, 30, Fade(BLACK, 0.28f));
@@ -1688,7 +2057,7 @@ static void ScreenResults(void) {
     else snprintf(line, sizeof line, "Level %d - %s", app.levelIndex + 1, levelNames[app.levelIndex]);
     DrawTextCentered(line, 500, (int)card.y + 50, 22, COLOR_DIM);
     if (!practice) DrawStarRow(500, card.y + 128, 36, app.levelGems, t - 0.3f);
-    snprintf(line, sizeof line, "SCORE %d / %d      +%d XP", app.correctCount, app.questionCount, app.levelXp);
+    snprintf(line, sizeof line, "SCORE %d / %d      +%d XP", app.correctCount, app.questionCount, (int)(app.levelXp * Smooth((t - 0.3f) / 1.2f)));
     DrawTextCentered(line, 500, (int)card.y + (practice ? 110 : 190), 28, COLOR_TXT);
 
     float spacing = 46, startX = 500 - (app.questionCount - 1) * spacing / 2;
@@ -1789,7 +2158,7 @@ static void DrawReviewOverview(Rectangle panel) {
     int percent = totalAttempts ? totalCorrect * 100 / totalAttempts : 0;
     Vector2 ring = V2(panel.x + 160, panel.y + 118);
     DrawRing(ring, 56, 80, 0, 360, 60, (Color){34, 32, 84, 255});
-    if (totalAttempts) DrawRing(ring, 56, 80, 270, 270 + 360.0f * percent / 100.0f, 60, percent >= 80 ? COLOR_GREEN : (percent >= 50 ? COLOR_YELLOW : COLOR_RED));
+    if (totalAttempts) DrawRing(ring, 56, 80, 270, 270 + 360.0f * percent / 100.0f * Smooth((app.screenTime - 0.2f) / 0.8f), 60, percent >= 80 ? COLOR_GREEN : (percent >= 50 ? COLOR_YELLOW : COLOR_RED));
     char text[64];
     snprintf(text, sizeof text, totalAttempts ? "%d%%" : "--", percent);
     DrawTextCentered(text, (int)ring.x, (int)ring.y - 20, 38, COLOR_TXT);
@@ -1831,7 +2200,7 @@ static void DrawReviewOverview(Rectangle panel) {
         DrawText(levelNames[l], (int)row.x + 66, (int)row.y + 7, 20, COLOR_TXT);
         Rectangle track = { row.x + 66, row.y + 36, 220, 14 };
         DrawRound(track, 7, (Color){34, 32, 84, 255});
-        if (attempts) DrawRound((Rectangle){ track.x, track.y, track.width * pct / 100.0f < 14 ? 14 : track.width * pct / 100.0f, track.height }, 7, pct >= 80 ? COLOR_GREEN : (pct >= 50 ? COLOR_YELLOW : COLOR_RED));
+        if (attempts) DrawRound((Rectangle){ track.x, track.y, track.width * pct / 100.0f * Smooth((app.screenTime - 0.25f - l * 0.1f) / 0.5f) < 14 ? 14 : track.width * pct / 100.0f * Smooth((app.screenTime - 0.25f - l * 0.1f) / 0.5f), track.height }, 7, pct >= 80 ? COLOR_GREEN : (pct >= 50 ? COLOR_YELLOW : COLOR_RED));
         snprintf(number, sizeof number, "%d%%", pct);
         if (attempts) DrawText(number, (int)track.x + 232, (int)track.y - 3, 20, COLOR_TXT);
         else DrawText("not played", (int)track.x + 232, (int)track.y - 1, 16, COLOR_GRAY);
@@ -1944,6 +2313,25 @@ static void ScreenReview(void) {
 }
 
 // ================================================================ main loop
+// Small speaker button (top right of every screen). Press M too, except while answering questions.
+static void DrawSoundToggle(void) {
+    Rectangle r = { 940, 71, 44, 26 };
+    bool hovered = HoverRect(r);
+    if ((IsKeyPressed(KEY_M) && app.screen != SCREEN_QUESTION) || TakeClick(hovered)) { soundOn = !soundOn; if (soundOn) PlayFx(FX_BLIP); }
+    DrawRoundOutlined(r, 8, 2, COLOR_CREAM, hovered ? COLOR_CYAN : COLOR_INK);
+    Color c = soundOn ? COLOR_CYAN : COLOR_GRAY;
+    DrawRectangle((int)r.x + 10, (int)r.y + 9, 6, 8, c);
+    DrawTriSafe(V2(r.x + 16, r.y + 9), V2(r.x + 24, r.y + 4), V2(r.x + 24, r.y + 22), c);
+    DrawTriSafe(V2(r.x + 16, r.y + 9), V2(r.x + 24, r.y + 22), V2(r.x + 16, r.y + 17), c);
+    if (soundOn) {
+        DrawRing(V2(r.x + 25, r.y + 13), 5, 7, 305, 415, 10, c);
+        DrawRing(V2(r.x + 25, r.y + 13), 10, 12, 305, 415, 12, c);
+    } else {
+        DrawLineEx(V2(r.x + 28, r.y + 8), V2(r.x + 38, r.y + 18), 3, COLOR_RED);
+        DrawLineEx(V2(r.x + 28, r.y + 18), V2(r.x + 38, r.y + 8), 3, COLOR_RED);
+    }
+}
+
 static void InitApp(void) {
     SetExitKey(KEY_NULL);   // ESC is used for "back"
     for (int i = 0; i < SPARKLE_COUNT; i++) sparklePos[i] = V2((float)GetRandomValue(0, WINDOW_WIDTH), (float)GetRandomValue(0, WINDOW_HEIGHT));
@@ -1951,12 +2339,14 @@ static void InitApp(void) {
     app.selectedLevel = -1;
     app.pendingHop = app.hopFrom = app.hopTo = app.unlockLevel = app.autoOpenLevel = -1;
     LoadProgress();
+    InitAudio();
 }
 
 static void FrameUpdate(void) {
     float dt = GetFrameTime();
     app.screenTime += dt;
     UpdateEffects(dt);
+    UpdateAudio(dt, app.screen == SCREEN_QUESTION);
     clickConsumed = false;
     wantHand = false;
     uiLocked = false;
@@ -1970,6 +2360,7 @@ static void FrameUpdate(void) {
         case SCREEN_REVIEW:   ScreenReview();   break;
     }
     DrawEffects();
+    DrawSoundToggle();
     for (int y = 0; y < WINDOW_HEIGHT; y += 3) DrawRectangle(0, y, WINDOW_WIDTH, 1, Fade(BLACK, 0.2f));   // CRT scanlines
     if (app.screenTime < 0.55f) {   // "blinds" wipe between screens
         const int slats = 14;
@@ -1991,6 +2382,7 @@ int main(void) {
     SetTargetFPS(60);
     InitApp();
     while (!WindowShouldClose()) FrameUpdate();
+    ShutdownAudio();
     CloseWindow();
     return 0;
 }
