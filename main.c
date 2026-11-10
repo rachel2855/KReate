@@ -19,9 +19,9 @@
 
 #define WINDOW_WIDTH 1000
 #define WINDOW_HEIGHT 640
-#define LEVEL_COUNT 5
+#define LEVEL_COUNT 17
 #define MAX_QUESTIONS_PER_LEVEL 5
-#define MAX_BANK 64
+#define MAX_BANK 224
 #define MAX_PARTICLES 320
 #define MAX_FLOATS 8
 #define BG_CANDY_COUNT 20
@@ -56,7 +56,7 @@
 #define COLOR_CODE_BG ((Color){8, 12, 34, 255})
 #define COLOR_CODE_TXT ((Color){158, 232, 226, 255})
 
-typedef enum { SCREEN_TITLE, SCREEN_PROFILES, SCREEN_HUB, SCREEN_NOTES, SCREEN_MAP, SCREEN_QUESTION, SCREEN_RESULTS, SCREEN_REVIEW } ScreenState;
+typedef enum { SCREEN_TITLE, SCREEN_PROFILES, SCREEN_HUB, SCREEN_NOTES, SCREEN_MAP, SCREEN_QUESTION, SCREEN_RESULTS, SCREEN_REVIEW, SCREEN_WARDROBE } ScreenState;
 typedef enum { MODE_MCQ, MODE_TYPED, MODE_COUNT } QuizMode;
 typedef enum { KIND_MCQ, KIND_SHORT, KIND_CODE } QuestionKind;
 typedef enum { ST_UNSEEN, ST_CORRECT, ST_WRONG, ST_SKIPPED, ST_FIXED } QStatus;   // FIXED = wrong first, right on retry
@@ -78,13 +78,28 @@ typedef struct {
 
 typedef struct { unsigned short attempts, correct, wrong, skipped; } QStat;   // lifetime stats per question
 
+#define SLOT_COUNT 4        // wardrobe slots: head, face, neck, back
+#define ACC_COUNT 14
 typedef struct {
     int bestGems[MODE_COUNT][LEVEL_COUNT];
     int totalXp;             // shown to the player as HP
-    QStat stats[MAX_BANK];   // indexed by position in questionBank; older save files simply load without it
+    QStat stats[MAX_BANK];   // indexed by position in questionBank
     int boost[3];            // owned boosters: 50/50, shield, 2x HP
     int milestone;           // HP milestones already rewarded
+    int crown;               // 1 = Byte is wearing the flawless-clear crown right now
+    unsigned int owned;      // bit i set = accessory i collected
+    int equipped[SLOT_COUNT];   // accessory index + 1 worn in each slot, 0 = nothing
+    int crownsEarned;        // lifetime count of flawless clears
 } Progress;
+
+// Layout of save files written by the previous version (5 levels, 64 questions). They are converted on load.
+typedef struct {
+    int bestGems[MODE_COUNT][5];
+    int totalXp;
+    QStat stats[64];
+    int boost[3];
+    int milestone;
+} LegacyProgress;
 
 typedef struct {
     ScreenState screen;
@@ -131,6 +146,11 @@ typedef struct {
     bool shieldOn, doubleOn, used5050[MAX_QUESTIONS_PER_LEVEL];
     int bonusHp;
     char rewardText[96];
+    // overlays and extras
+    bool statsOpen;                          // HP / stars info panel
+    int wardrobeSlot;                        // wardrobe screen: which slot tab is shown
+    float crownFall, botSad;                 // crown-lost animation and the "sad, then smiles again" timer
+    bool crownEarnedNow, crownLostNow;       // for the results screen
     Progress progress;
 } AppState;
 
@@ -142,22 +162,31 @@ static Particle particles[MAX_PARTICLES];
 static FloatText floatTexts[MAX_FLOATS];
 static Vector2 sparklePos[SPARKLE_COUNT];
 static bool uiLocked, clickConsumed, wantHand;
-static const int mapNodeCount[MODE_COUNT] = { 4, 5 };   // the Function Lab only exists on the typing map
-static const Vector2 nodePos[MODE_COUNT][LEVEL_COUNT] = {
-    { {140, 440}, {350, 330}, {575, 440}, {800, 300}, {0, 0} },
-    { {120, 450}, {320, 345}, {510, 455}, {690, 335}, {870, 215} },
-};
 static const char *levelNames[LEVEL_COUNT] = {
-    "Variables & Types", "Operators & Casting", "Decisions & Loops", "Arrays & Strings", "Function Lab (stretch)"
+    "Variables & Types", "Operators & Casting", "Decisions & Loops", "Arrays & Strings", "Functions & Function Lab",
+    "Pointers 101", "Pointers & Functions", "Pointer Lab", "Dynamic Memory", "Linked Lists",
+    "Classes & Objects", "Operator Overloading", "STL Lists & Maps", "Templates & Vectors",
+    "Lab Exam: Numbers", "Lab Exam: Arrays", "Lab Exam: Grids & Text"
 };
 static const char *levelBlurbs[LEVEL_COUNT] = {
-    "int, char, const and the printf format specifiers.",
+    "int, char, const, scanf and the printf format specifiers.",
     "Maths operators, integer division, remainders and casting.",
-    "if / else, do-while, break and continue.",
-    "Array indexes, the string terminator and sizeof.",
-    "Write real C functions. They get compiled and tested with gcc!"
+    "if / else, switch, loops, break and continue.",
+    "Array indexes, 2D arrays, the string terminator and sizeof.",
+    "Functions, return values, pass by value and real code compiled with gcc!",
+    "Addresses, the & and * operators, NULL and double pointers.",
+    "Pass by pointer, swap, pointer arithmetic and function pointers.",
+    "The pointer lab: strings and arrays using pointers only.",
+    "Stack vs heap, new / delete, malloc / free, leaks and dangling pointers.",
+    "Nodes, head and next, insert, traverse, delete, doubly linked lists.",
+    "Classes, fields, instances, methods, constructors and passing objects.",
+    "Function and operator overloading, operator+, this, const references.",
+    "std::list, iterators, splice, std::map, find, insert and pairs.",
+    "Template functions and classes, vector, capacity, stack and queue.",
+    "Exam prep: leap years, digits, palindromes, primes and binary.",
+    "Exam prep: search, duplicates, 2nd largest and the two-movies puzzle.",
+    "Exam prep: word counting, rotate, insert, triangles, clusters and scope."
 };
-
 
 #define MCQ_Q(lvl, prompt, snippet, a, b, c, d, correct, hint, why) \
     { lvl, KIND_MCQ, prompt, snippet, {a, b, c, d}, correct, "", hint, why, "", "" }
@@ -166,8 +195,10 @@ static const char *levelBlurbs[LEVEL_COUNT] = {
 #define CODE_Q(lvl, prompt, starter, harness, hint, why) \
     { lvl, KIND_CODE, prompt, "", {"", "", "", ""}, 0, "", hint, why, starter, harness }
 
+// Every level has 5 multiple-choice questions (MCQ map) and up to 5 typed ones (typing map).
+// Typed questions are short answers or real C functions that get compiled with gcc.
 static const Question questionBank[] = {
-    // ---- Level 1: Variables & Types ----
+    // ================= Level 1: Variables & Types =================
     MCQ_Q(0, "Which format specifier prints an int?", "int age = 25;",
           "%c", "%d", "%s", "%f", 1, "Think: d for decimal integer.",
           "%d is for integers. %f is float/double, %c is char, %s is a string."),
@@ -179,22 +210,46 @@ static const Question questionBank[] = {
           "const double TAX_RATE = 0.08;", "constant double TAX_RATE = 0.08;",
           "final double TAX_RATE = 0.08;", "double TAX_RATE() = 0.08;", 0,
           "It is a short keyword, five letters.", "const makes a variable read-only. final and constant are not C keywords."),
+    MCQ_Q(0, "Which scanf call reads a whole number into age?", "int age;",
+          "scanf(\"%d\", age);", "scanf(\"%d\", &age);", "scanf(\"%f\", &age);", "scanf(age);", 1,
+          "scanf needs to know WHERE the variable lives.", "scanf stores the value at an address, so you pass &age (the address of age)."),
+    MCQ_Q(0, "How many bytes does a char normally use?", "",
+          "1", "2", "4", "8", 0, "A char holds a single character.", "A char is one byte. An int is usually 4 bytes."),
     SHORT_Q(0, "What does this print?", "char grade = 'A';\nprintf(\"Grade: %c\\n\", grade);",
             "Grade: A", "%c prints a single character.", "%c prints the character stored in grade, so you get: Grade: A"),
     SHORT_Q(0, "Type the full format specifier that prints a float with 2 decimal places.", "",
             "%.2f", "The number after the dot is the decimal count.", "%.2f means a float with exactly 2 digits after the decimal point."),
-    // ---- Level 2: Operators & Casting ----
+    SHORT_Q(0, "Which type stores decimals with more precision than float?", "",
+            "double", "It sounds like twice as much.", "double has about twice the precision of float."),
+    SHORT_Q(0, "What does this print?", "int x = 7;\nprintf(\"%d items\", x);",
+            "7 items", "%d is replaced by the value of x.", "%d becomes 7, so the output is: 7 items"),
+    SHORT_Q(0, "Which header file do you include to use printf and scanf?", "",
+            "stdio.h|<stdio.h>|#include <stdio.h>", "Standard input and output.", "#include <stdio.h> gives you printf and scanf."),
+
+    // ================= Level 2: Operators & Casting =================
     MCQ_Q(1, "What is 10 / 3 when both are ints?", "int a = 10, b = 3;\nprintf(\"%d\", a / b);",
           "3.33", "3", "4", "1", 1, "Integers cannot hold a fraction.", "Integer division truncates the decimal part, so 10 / 3 is 3."),
     MCQ_Q(1, "What does 10 % 3 give?", "",
           "3", "0", "1", "3.33", 2, "% is the remainder after dividing.", "10 = 3 * 3 + 1, so the remainder is 1."),
     MCQ_Q(1, "What is (float)7 / 2?", "",
           "3", "3.5", "4", "3.0", 1, "The cast happens before the division.", "Casting 7 to float first makes it a float division: 3.5."),
+    MCQ_Q(1, "What is the value of 2 + 3 * 4?", "",
+          "20", "14", "24", "9", 1, "Multiplication goes first.", "* is done before +, so 3 * 4 = 12 and then 2 + 12 = 14."),
+    MCQ_Q(1, "After this code, what are i and j?", "int i = 5;\nint j = i++;",
+          "i = 6, j = 5", "i = 5, j = 6", "i = 6, j = 6", "i = 5, j = 5", 0, "i++ uses the old value first, then adds 1.",
+          "Post-increment hands out the OLD value (5) to j and then increases i to 6."),
     SHORT_Q(1, "What does this print?", "int num = 10;\nnum += 5;\nnum *= 2;\nprintf(\"%d\", num);",
             "30", "Work line by line: 10, then 15, then...", "num becomes 15 after += 5, then 30 after *= 2."),
     SHORT_Q(1, "What does this print?", "int result = (int)3.9;\nprintf(\"%d\", result);",
             "3", "Casting to int does not round.", "Converting a float to int truncates toward zero, so 3.9 becomes 3."),
-    // ---- Level 3: Decisions & Loops ----
+    SHORT_Q(1, "What does this print? (two numbers)", "int a = 17, b = 5;\nprintf(\"%d %d\", a / b, a % b);",
+            "3 2", "Quotient first, then remainder.", "17 / 5 is 3 and 17 % 5 is 2."),
+    SHORT_Q(1, "What does this print?", "printf(\"%d\", 7 / 2 * 2);",
+            "6", "Left to right: 7 / 2 first.", "7 / 2 is 3 (integer division) and 3 * 2 is 6, not 7."),
+    SHORT_Q(1, "What does this print?", "double d = 7 / 2;\nprintf(\"%.1f\", d);",
+            "3.0", "The division happens BEFORE it is stored in a double.", "7 / 2 is integer division = 3, stored as 3.0."),
+
+    // ================= Level 3: Decisions & Loops =================
     MCQ_Q(2, "Which loop always runs its body at least once?", "",
           "for", "while", "do-while", "if", 2, "The condition is checked at the end.", "do-while runs the body first and checks the condition afterwards."),
     MCQ_Q(2, "What does continue do inside a loop?", "",
@@ -202,12 +257,24 @@ static const Question questionBank[] = {
           "Think of it as: skip the rest of this lap.", "continue jumps straight to the next iteration of the loop."),
     MCQ_Q(2, "What prints?", "int score = 75;\nif (score >= 80) printf(\"B\");\nelse if (score >= 70) printf(\"C\");\nelse printf(\"F\");",
           "B", "C", "F", "BC", 1, "Only the first true branch runs.", "75 fails the >= 80 test but passes >= 70, so C prints and the else is skipped."),
+    MCQ_Q(2, "In a switch, what happens if you forget break at the end of a case?", "",
+          "Compile error", "Execution falls through into the next case", "The switch ends anyway", "The program crashes", 1,
+          "Cases are just labels.", "Without break, the program keeps running into the following cases (fall-through)."),
+    MCQ_Q(2, "How many times does this loop run?", "for (int i = 0; i < 10; i += 3) { }",
+          "3", "4", "10", "5", 1, "List the values of i: 0, 3, ...", "i takes the values 0, 3, 6 and 9, so the body runs 4 times."),
     SHORT_Q(2, "What does this print? (separate numbers with spaces)",
             "for (int i = 1; i <= 5; i++) {\n    if (i % 2 == 0) continue;\n    printf(\"%d \", i);\n}",
             "1 3 5", "Even numbers are skipped.", "Even values hit continue, so only the odd numbers 1 3 5 are printed."),
     SHORT_Q(2, "Which keyword leaves a loop immediately?", "",
             "break", "Five letters. Also used in switch.", "break exits the nearest loop or switch straight away."),
-    // ---- Level 4: Arrays & Strings ----
+    SHORT_Q(2, "What does this print?", "int i = 0;\nwhile (i < 3) {\n    printf(\"%d\", i);\n    i++;\n}",
+            "012", "i starts at 0.", "The loop prints 0, then 1, then 2 and stops when i reaches 3."),
+    SHORT_Q(2, "What does this print?", "int n = 2;\nswitch (n) {\n    case 1: printf(\"A\");\n    case 2: printf(\"B\");\n    case 3: printf(\"C\"); break;\n    default: printf(\"D\");\n}",
+            "BC", "No break after case 2!", "case 2 prints B, falls through to case 3 which prints C, then break stops it."),
+    SHORT_Q(2, "What does this print?", "int total = 0;\nfor (int i = 1; i <= 4; i++) total += i;\nprintf(\"%d\", total);",
+            "10", "Add 1 + 2 + 3 + 4.", "The loop adds 1, 2, 3 and 4, giving 10."),
+
+    // ================= Level 4: Arrays & Strings =================
     MCQ_Q(3, "What is the index of the first element of an array?", "",
           "1", "0", "-1", "Depends on the type", 1, "C counts from zero.", "Array indexes start at 0, so numbers[0] is the first element."),
     MCQ_Q(3, "What character ends every C string?", "",
@@ -215,11 +282,38 @@ static const Question questionBank[] = {
     MCQ_Q(3, "How do you count the elements in int values[] = {...}?", "",
           "sizeof(values)", "sizeof(values) / sizeof(values[0])", "length(values)", "values.size()", 1,
           "Total bytes divided by bytes per element.", "sizeof(values) is total bytes, so divide by the size of one element."),
+    MCQ_Q(3, "Which line declares a 2D array with 3 rows and 4 columns?", "",
+          "int grid[3][4];", "int grid[4][3];", "int grid(3, 4);", "int[3][4] grid;", 0, "Rows come first.", "int grid[rows][cols]; so 3 rows and 4 columns is grid[3][4]."),
+    MCQ_Q(3, "Which function from <string.h> gives the length of a string?", "",
+          "strlen", "sizeof", "length", "strsize", 0, "It starts with str.", "strlen counts the characters before the '\\0'."),
     SHORT_Q(3, "What does this print?", "int numbers[5] = {10, 20, 30, 40, 50};\nprintf(\"%d\", numbers[2]);",
             "30", "Index 2 is the third element.", "Indexes run 0, 1, 2... so numbers[2] is 30."),
     SHORT_Q(3, "What does this print?", "char name[20] = \"Alice\";\nint len = 0;\nwhile (name[len] != '\\0') len++;\nprintf(\"%d\", len);",
             "5", "Count the letters before the terminator.", "The loop counts A, l, i, c, e and stops at '\\0', so len is 5."),
-    // ---- Level 5: Function Lab (typed mode only, compiled and tested with gcc) ----
+    SHORT_Q(3, "What does this print?", "int grid[2][3] = {{1, 2, 3}, {4, 5, 6}};\nprintf(\"%d\", grid[1][2]);",
+            "6", "Row 1, column 2 (both start at 0).", "grid[1] is the second row {4, 5, 6} and [2] is its last element: 6."),
+    SHORT_Q(3, "What does this print?", "char word[] = \"Hi\";\nprintf(\"%d\", (int)sizeof(word));",
+            "3", "Do not forget the hidden terminator.", "H, i and the '\\0' make 3 bytes."),
+    SHORT_Q(3, "What does this print?", "int a[4] = {5, 6, 7, 8};\nprintf(\"%d\", a[1] + a[3]);",
+            "14", "a[1] is 6 and a[3] is 8.", "6 + 8 = 14."),
+
+    // ================= Level 5: Functions & Function Lab =================
+    MCQ_Q(4, "What does a void function return?", "",
+          "0", "Nothing", "NULL", "-1", 1, "void means empty.", "A void function does not hand any value back to its caller."),
+    MCQ_Q(4, "How does C pass arguments to a function?", "",
+          "By value (a copy)", "By reference", "By name", "As global variables", 0, "The function gets its own copy.", "C copies each argument into the parameter, so changing the parameter does not change the caller's variable."),
+    MCQ_Q(4, "What prints?", "void addOne(int n) { n = n + 1; }\nint main() {\n    int x = 5;\n    addOne(x);\n    printf(\"%d\", x);\n}",
+          "6", "5", "0", "It will not compile", 1, "addOne only changes its own copy.", "x is passed by value, so addOne changes a copy and x stays 5."),
+    MCQ_Q(4, "Where should a function prototype go?", "",
+          "Before main (before the first call)", "Inside main only", "After the program ends", "Prototypes do not exist in C", 0,
+          "The compiler reads top to bottom.", "The compiler must know a function's signature before it sees a call to it."),
+    MCQ_Q(4, "Which is a valid prototype for a function taking two ints and returning an int?", "",
+          "int add(int a, int b);", "add(int a, b);", "int add(a, b int);", "function int add(int, int);", 0,
+          "Return type, name, then typed parameters.", "A prototype lists the return type, the name and the type of every parameter."),
+    SHORT_Q(4, "Which keyword is used as the return type of a function that gives nothing back?", "",
+            "void", "It also means 'empty'.", "void is the return type for functions that return nothing."),
+    SHORT_Q(4, "What does this print?", "int twice(int n) { return n * 2; }\nprintf(\"%d\", twice(twice(3)));",
+            "12", "Work from the inside out.", "twice(3) is 6 and twice(6) is 12."),
     CODE_Q(4, "Write int square(int x) that returns x multiplied by itself.", "int square(int x) {\n    \n}",
            "int main() { if (square(3) == 9 && square(-4) == 16 && square(0) == 0) printf(\"PASS\"); else printf(\"FAIL\"); return 0; }",
            "One line: return x * x;", "Solution: return x * x;"),
@@ -230,14 +324,315 @@ static const Question questionBank[] = {
            "int sumArray(int arr[], int size) {\n    \n}",
            "int main() { int a[4] = {1, 2, 3, 4}; int b[1] = {7}; if (sumArray(a, 4) == 10 && sumArray(b, 1) == 7 && sumArray(a, 0) == 0) printf(\"PASS\"); else printf(\"FAIL\"); return 0; }",
            "Keep a running total in a for loop.", "Solution: int sum = 0; for (int i = 0; i < size; i++) sum += arr[i]; return sum;"),
+
+    // ================= Level 6: Pointers 101 =================
+    MCQ_Q(5, "What does the & operator give you?", "",
+          "The value stored in a variable", "The address of a variable", "The size of a variable", "A copy of a variable", 1,
+          "Think: address-of.", "&x is the memory address where x lives."),
+    MCQ_Q(5, "What does *ptr do when ptr points at an int?", "",
+          "Gets the address of ptr", "Reads or writes the int that ptr points to", "Multiplies ptr", "Declares a new pointer", 1,
+          "It is called dereferencing.", "*ptr follows the address stored in ptr to the actual value."),
+    MCQ_Q(5, "What prints?", "int i = 5;\nint *ptr = &i;\n*ptr = 10;\nprintf(\"%d\", i);",
+          "5", "10", "An address", "It will not compile", 1, "ptr points at i.", "Writing through *ptr changes i itself, so i is now 10."),
+    MCQ_Q(5, "Which line declares a pointer to an int?", "",
+          "int ptr;", "int *ptr;", "pointer int ptr;", "int &ptr;", 1, "The star goes next to the type.", "int *ptr; declares ptr as a pointer to int."),
+    MCQ_Q(5, "What does a pointer variable actually store?", "",
+          "A copy of a value", "A memory address", "A string", "A function", 1, "It points somewhere.", "A pointer holds the address of another variable, not the value itself."),
+    SHORT_Q(5, "Which operator gets the address of a variable? (type the symbol)", "",
+            "&", "It looks like 'and'.", "& is the address-of operator."),
+    SHORT_Q(5, "What does this print? (two numbers)", "int i = 5, j = 10;\nint *p = &i;\n*p = 3;\np = &j;\n*p = -2;\nprintf(\"%d %d\", i, j);",
+            "3 -2", "p points at i first, then at j.", "First *p = 3 changes i. Then p is re-pointed to j and *p = -2 changes j."),
+    SHORT_Q(5, "What does this print?", "int i = 5;\nint *p = &i;\nint **pp = &p;\n**pp = 7;\nprintf(\"%d\", i);",
+            "7", "pp points to p, which points to i.", "**pp follows two arrows and reaches i, so i becomes 7."),
+    SHORT_Q(5, "Which value marks a pointer that points at nothing?", "",
+            "NULL|nullptr|0", "Four capital letters.", "NULL (or nullptr in C++) means the pointer points nowhere. Never dereference it."),
+    CODE_Q(5, "Write void setToZero(int *p) that sets the int p points to, to 0.", "void setToZero(int *p) {\n    \n}",
+           "int main() { int a = 9; int b = -4; setToZero(&a); setToZero(&b); if (a == 0 && b == 0) printf(\"PASS\"); else printf(\"FAIL\"); return 0; }",
+           "Write through the pointer with *p.", "Solution: *p = 0;"),
+
+    // ================= Level 7: Pointers & Functions =================
+    MCQ_Q(6, "Why does swap(int a, int b) fail to swap the caller's variables?", "",
+          "The arguments are copies", "swap is a reserved word", "ints cannot be swapped", "It needs a return value", 0,
+          "Think pass by value.", "The function swaps its own copies. To change the caller's variables, pass their addresses."),
+    MCQ_Q(6, "How do you call void swap_ints(int *a, int *b) to swap x and y?", "",
+          "swap_ints(x, y);", "swap_ints(&x, &y);", "swap_ints(*x, *y);", "swap_ints(&&x, &&y);", 1,
+          "The function wants addresses.", "Pass the addresses with & so the function can reach the originals."),
+    MCQ_Q(6, "What prints?", "int arr[3] = {10, 20, 30};\nint *p = arr;\nprintf(\"%d\", *(p + 2));",
+          "10", "20", "30", "An address", 2, "p + 2 moves two ints along.", "p points at arr[0], so *(p + 2) is arr[2] = 30."),
+    MCQ_Q(6, "If p points at arr[0], what does p++ do?", "",
+          "Adds 1 to the value", "Moves p to the next int, arr[1]", "Moves p one byte along", "Sets p to NULL", 1,
+          "Pointer arithmetic is scaled by the type.", "Adding 1 to a pointer moves it by one element of its type."),
+    MCQ_Q(6, "Which is a valid function pointer for int f(int, int)?", "",
+          "int (*fp)(int, int);", "int *fp(int, int);", "fp int(int, int);", "int fp*(int, int);", 0,
+          "The star goes in brackets with the name.", "int (*fp)(int, int); declares fp as a pointer to such a function."),
+    SHORT_Q(6, "What does this print?", "void f(int *p) { *p = 5; }\nint main() {\n    int i = 3;\n    f(&i);\n    printf(\"%d\", i);\n}",
+            "5", "f writes through the pointer.", "f receives the address of i and sets it to 5."),
+    SHORT_Q(6, "What does this print?", "int a[4] = {2, 4, 6, 8};\nint *p = a + 1;\nprintf(\"%d\", *p + *(p + 2));",
+            "12", "p points at a[1].", "*p is a[1] = 4 and *(p + 2) is a[3] = 8, so the sum is 12."),
+    SHORT_Q(6, "Which array expression is the same as *(arr + i)?", "",
+            "arr[i]", "Index notation.", "arr[i] is just shorthand for *(arr + i)."),
+    CODE_Q(6, "Write void swap_ints(int *a, int *b) that swaps the two integers.", "void swap_ints(int *a, int *b) {\n    \n}",
+           "int main() { int x = 5, y = 10; swap_ints(&x, &y); if (x == 10 && y == 5) printf(\"PASS\"); else printf(\"FAIL\"); return 0; }",
+           "Save one value in a temp variable first.", "Solution: int t = *a; *a = *b; *b = t;"),
+    CODE_Q(6, "Write int sum_array(int *arr, int size) that adds up the elements using pointer arithmetic (no [] allowed in the lab).",
+           "int sum_array(int *arr, int size) {\n    \n}",
+           "int main() { int a[4] = {1, 2, 3, 4}; int b[2] = {-5, 5}; if (sum_array(a, 4) == 10 && sum_array(b, 2) == 0 && sum_array(a, 0) == 0) printf(\"PASS\"); else printf(\"FAIL\"); return 0; }",
+           "Use *(arr + i) inside a loop.", "Solution: int s = 0; for (int i = 0; i < size; i++) s += *(arr + i); return s;"),
+
+    // ================= Level 8: Pointer Lab =================
+    MCQ_Q(7, "In the pointer lab, what is NOT allowed inside the functions?", "",
+          "Array indexing like arr[i]", "Pointer arithmetic like *(arr + i)", "Dereferencing with *", "Loops", 0,
+          "The whole point is practising pointers.", "The lab rules say: no arr[i]. Use pointer arithmetic only."),
+    MCQ_Q(7, "What prints?", "char s[] = \"Hello\";\nchar *p = s;\nint n = 0;\nwhile (*p != '\\0') { n++; p++; }\nprintf(\"%d\", n);",
+          "4", "5", "6", "0", 1, "Count the letters.", "The loop moves p along until it meets '\\0', counting 5 letters."),
+    MCQ_Q(7, "What is the safe way to walk along a C string with a pointer?", "",
+          "Loop until *p is '\\0'", "Loop exactly 100 times", "Loop until *p is a space", "Loop until p is 0", 0,
+          "Every string ends with a terminator.", "Strings end with '\\0', so stop when *p is '\\0'."),
+    MCQ_Q(7, "To reverse an array in place with two pointers, after swapping *left and *right you...", "",
+          "do left++ and right--", "do left-- and right++", "do left++ and right++", "start again", 0,
+          "The pointers walk towards the middle.", "left moves forward and right moves back until they meet."),
+    MCQ_Q(7, "What should compare_strings(\"apple\", \"banana\") return?", "",
+          "A negative number", "Zero", "A positive number", "Exactly 1", 0, "'a' comes before 'b'.", "apple is lexicographically smaller than banana, so the result is negative."),
+    SHORT_Q(7, "How many vowels are counted? (O, e or A count; others do not)", "char *s = \"OpenAI\";\nint v = 0;\nfor (; *s; s++)\n    if (*s == 'O' || *s == 'e' || *s == 'A') v++;\nprintf(\"%d\", v);",
+            "3", "Spot the letters O, e and A.", "OpenAI contains O, e and A, so v is 3."),
+    CODE_Q(7, "Write int find_max(int *arr, int size) that returns the largest element.", "int find_max(int *arr, int size) {\n    \n}",
+           "int main() { int a[5] = {3, 9, 2, 8, 5}; int b[3] = {-4, -9, -1}; int c[1] = {7}; if (find_max(a, 5) == 9 && find_max(b, 3) == -1 && find_max(c, 1) == 7) printf(\"PASS\"); else printf(\"FAIL\"); return 0; }",
+           "Start with the first element, then compare the rest.", "Solution: int m = *arr; for (int i = 1; i < size; i++) if (*(arr + i) > m) m = *(arr + i); return m;"),
+    CODE_Q(7, "Write void reverse_array(int *arr, int size) that reverses the array in place.", "void reverse_array(int *arr, int size) {\n    \n}",
+           "int main() { int a[5] = {1, 2, 3, 4, 5}; int b[4] = {1, 2, 3, 4}; reverse_array(a, 5); reverse_array(b, 4); if (a[0] == 5 && a[1] == 4 && a[2] == 3 && a[3] == 2 && a[4] == 1 && b[0] == 4 && b[1] == 3 && b[2] == 2 && b[3] == 1) printf(\"PASS\"); else printf(\"FAIL\"); return 0; }",
+           "Swap the two ends and walk inwards.", "Solution: int *l = arr, *r = arr + size - 1; while (l < r) { int t = *l; *l = *r; *r = t; l++; r--; }"),
+    CODE_Q(7, "Write void copy_string(char *dest, char *src) that copies src (including the '\\0') into dest.", "void copy_string(char *dest, char *src) {\n    \n}",
+           "int main() { char d[10]; char e[10] = \"zzzz\"; copy_string(d, \"Hello\"); copy_string(e, \"\"); if (d[0] == 'H' && d[4] == 'o' && d[5] == '\\0' && e[0] == '\\0') printf(\"PASS\"); else printf(\"FAIL\"); return 0; }",
+           "Copy each char, then do not forget the terminator.", "Solution: while (*src) { *dest = *src; dest++; src++; } *dest = '\\0';"),
+    CODE_Q(7, "Write void concat_strings(char *dest, char *src) that appends src to the end of dest.", "void concat_strings(char *dest, char *src) {\n    \n}",
+           "#include <string.h>\nint main() { char d[20] = \"Hello, \"; char e[20] = \"\"; concat_strings(d, \"World!\"); concat_strings(e, \"ab\"); if (strcmp(d, \"Hello, World!\") == 0 && strcmp(e, \"ab\") == 0) printf(\"PASS\"); else printf(\"FAIL\"); return 0; }",
+           "First move dest to its '\\0', then copy.", "Solution: while (*dest) dest++; while (*src) { *dest = *src; dest++; src++; } *dest = '\\0';"),
+
+    // ================= Level 9: Dynamic Memory =================
+    MCQ_Q(8, "Where does memory allocated with new (or malloc) live?", "",
+          "The stack", "The heap", "In registers", "In the program's code", 1, "It lives until YOU free it.", "new and malloc take memory from the heap. It stays until you delete or free it."),
+    MCQ_Q(8, "What must you do for every new?", "",
+          "Call delete (delete[] for arrays)", "Nothing, C++ cleans up", "Call free()", "Restart the program", 0, "Memory you take must be given back.", "Every new needs a matching delete, otherwise the memory leaks."),
+    MCQ_Q(8, "What is a memory leak?", "",
+          "Heap memory that is never freed", "Reading past the end of an array", "Using too many variables", "A pointer set to NULL", 0, "The memory is lost until the program ends.", "A leak happens when you lose or forget the pointer to heap memory without freeing it."),
+    MCQ_Q(8, "What is wrong with this code?", "int *p = new int;\n*p = 5;\ndelete p;\ndelete p;",
+          "Nothing", "A memory leak", "A double delete (undefined behaviour)", "p is uninitialised", 2, "Count the deletes.", "Memory must be deleted exactly once. Deleting twice is undefined behaviour."),
+    MCQ_Q(8, "Which line correctly frees this array?", "int *arr = new int[n];",
+          "delete arr;", "delete[] arr;", "free(arr);", "arr = NULL;", 1, "Arrays use the bracket form.", "Memory from new[] must be released with delete[]."),
+    SHORT_Q(8, "Which C++ keyword allocates memory on the heap?", "",
+            "new", "Three letters.", "new allocates heap memory and returns a pointer to it."),
+    SHORT_Q(8, "In C, which function allocates heap memory?", "",
+            "malloc|malloc()", "It starts with m.", "malloc(size) allocates size bytes on the heap and returns a pointer (or NULL on failure)."),
+    SHORT_Q(8, "In C, which function releases memory that came from malloc?", "",
+            "free|free()", "The opposite of malloc.", "free(ptr) gives the memory back."),
+    SHORT_Q(8, "A pointer that still points at memory that was already freed is called a ... ? (two words)", "",
+            "dangling pointer|a dangling pointer", "It hangs around pointing at nothing useful.", "Using a dangling pointer is undefined behaviour. Set pointers to NULL after freeing."),
+    SHORT_Q(8, "What does this print?", "int *p = new int(5);\n*p += 2;\ncout << *p;\ndelete p;",
+            "7", "new int(5) starts the int at 5.", "The heap int starts at 5, += 2 makes 7."),
+
+    // ================= Level 10: Linked Lists =================
+    MCQ_Q(9, "What does each node of a singly linked list contain?", "",
+          "Data and a pointer to the next node", "Only data", "Data and the size of the list", "Two arrays", 0, "Think: payload plus link.", "A node holds its data and a next pointer to the node after it."),
+    MCQ_Q(9, "How do you know you have reached the end of a singly linked list?", "",
+          "next is nullptr (NULL)", "data is 0", "head is NULL", "You count the nodes", 0, "The last node points nowhere.", "The last node's next pointer is NULL, which stops a traversal loop."),
+    MCQ_Q(9, "Why does a list class that uses new need a copy constructor and assignment operator?", "",
+          "The default copy would copy pointers, so two lists would share the same nodes", "To make it faster", "C++ always requires it", "It does not need them", 0,
+          "Shallow copy versus deep copy.", "The default copy duplicates the pointers, not the nodes. A deep copy builds new nodes."),
+    MCQ_Q(9, "What does this code do?", "Node *n = new Node;\nn->data = 7;\nn->next = head;\nhead = n;",
+          "Inserts a new node at the front", "Inserts a node at the end", "Deletes the first node", "Reverses the list", 0, "The new node points at the old head.", "The new node is linked in front of the old head, then becomes the new head."),
+    MCQ_Q(9, "Which extra pointer does a node in a doubly linked list have?", "",
+          "prev, pointing at the previous node", "size", "parent", "tail only", 0, "You can walk backwards.", "A doubly linked node has both next and prev pointers."),
+    SHORT_Q(9, "Which operator accesses a member through a pointer, as in n->data? (type the 2-character operator)", "",
+            "->", "A dash and a greater-than sign.", "p->x is shorthand for (*p).x."),
+    SHORT_Q(9, "What does this print?", "// list: 1 -> 2 -> 3\nNode *p = head;\nint sum = 0;\nwhile (p != nullptr) {\n    sum += p->data;\n    p = p->next;\n}\ncout << sum;",
+            "6", "Add every node's data.", "The loop visits 1, 2 and 3 and adds them up: 6."),
+    SHORT_Q(9, "To delete the head: Node *temp = head; head = head->___; delete temp;", "",
+            "next", "Move head to the second node.", "head = head->next makes the second node the new head before the old one is deleted."),
+    SHORT_Q(9, "A list class that allocates nodes with new needs which special method to free them? (one word)", "",
+            "destructor|the destructor", "It is the opposite of a constructor.", "The destructor runs when the list is destroyed and should delete every node."),
+    SHORT_Q(9, "Which value marks an empty list in modern C++? (one word)", "",
+            "nullptr|NULL", "The head points at nothing.", "An empty list has head == nullptr."),
+
+    // ================= Level 11: Classes & Objects =================
+    MCQ_Q(10, "What is a class?", "",
+          "A user-defined type that groups data and functions", "A kind of loop", "A pointer", "A header file", 0, "It is a blueprint.", "A class groups related fields (data) and methods (functions) into a new type."),
+    MCQ_Q(10, "What is an instance?", "",
+          "One object created from a class", "The class definition", "A method", "A header", 0, "Vector v1; creates one.", "An instance is an occurrence of a class, with its own set of field values."),
+    MCQ_Q(10, "What prints?", "class Point { public: double x, y; };\nvoid move(Point p) { p.x += 1; }\nint main() {\n    Point a; a.x = 3; a.y = 4;\n    move(a);\n    cout << a.x;\n}",
+          "3", "4", "1", "It will not compile", 0, "move got a copy.", "Passing by value copies the object, so a is unchanged."),
+    MCQ_Q(10, "How can a function modify the caller's object?", "",
+          "Pass it by reference (Point &p) or by pointer", "Pass it by value", "Make it const", "Make it global", 0, "Do not copy it.", "A reference or a pointer lets the function work on the original object."),
+    MCQ_Q(10, "What small mistake often causes cryptic compiler errors after a class definition?", "",
+          "Forgetting the semicolon after the closing brace", "Using public", "Naming a field x", "Using double", 0, "class Foo { ... }?", "A class definition must end with };"),
+    SHORT_Q(10, "Which keyword starts a class definition?", "",
+            "class", "Five letters.", "class Name { ... };"),
+    SHORT_Q(10, "Which operator accesses a field of an object p? (type the symbol)", "",
+            ".", "p.x", "Use the dot operator: p.x"),
+    SHORT_Q(10, "What does this print?", "Point a;\na.x = 3;\nPoint b = a;\nb.x = 9;\ncout << a.x;",
+            "3", "Assigning copies every field.", "b is a copy of a, so changing b.x leaves a.x at 3."),
+    SHORT_Q(10, "A function that belongs to a class is called a ... ? (two words)", "",
+            "member function|method", "Also simply called a method.", "Methods (member functions) are functions that are part of a class."),
+    SHORT_Q(10, "Inside a method, which keyword is a pointer to the current object?", "",
+            "this", "Four letters.", "this points at the object the method was called on."),
+
+    // ================= Level 12: Operator Overloading =================
+    MCQ_Q(11, "What does function overloading mean?", "",
+          "Several functions share a name but differ in their parameters", "A function calls itself", "A function is too long", "Two functions have the same body", 0, "Same name, different arguments.", "The compiler picks the version whose parameter types match the call."),
+    MCQ_Q(11, "Can you overload a function by changing only its return type?", "",
+          "No", "Yes", "Only for int", "Only inside classes", 0, "The call does not show the return type.", "Overloads must differ in the type or number of parameters."),
+    MCQ_Q(11, "What is the name of the function that overloads + for a Box class?", "",
+          "operator+", "plus", "add", "overload+", 0, "A keyword, then the symbol.", "Overloaded operators are functions named operator followed by the symbol."),
+    MCQ_Q(11, "In Box3 = Box1 + Box2 using a member operator+, what is this->length?", "Box operator+(const Box& b) {\n    Box box;\n    box.length = this->length + b.length;\n    return box;\n}",
+          "The length of Box1 (the left operand)", "The length of Box2", "A global variable", "The length of the result", 0, "Box1 calls operator+.", "The object on the left calls the operator, so this points at Box1 and b is Box2."),
+    MCQ_Q(11, "Why take the parameter as const Box& ?", "",
+          "It avoids a copy and promises not to change it", "It is required for every function", "It makes the function global", "It makes it return faster only", 0, "Reference plus const.", "A const reference passes the object cheaply and read-only."),
+    SHORT_Q(11, "Which keyword starts the name of an overloaded operator, as in operator+ ?", "",
+            "operator", "It is a long word.", "You write operator followed by the symbol, for example operator+."),
+    SHORT_Q(11, "In Box3 = Box1 + Box2, which object is this inside a member operator+? (type its name)", "",
+            "Box1", "The left-hand operand.", "The left operand calls the member operator, so this is Box1."),
+    SHORT_Q(11, "A NON-member operator+ takes how many parameters? (a number)", "",
+            "2|two", "One for each operand.", "A non-member version has no this, so it takes both operands: operator+(const Box&, const Box&)."),
+    SHORT_Q(11, "print(int), print(double) and print(char*) exist. Which parameter type does print(500.263) call?", "",
+            "double", "500.263 has a decimal point.", "A decimal literal is a double, so print(double) is chosen."),
+    SHORT_Q(11, "Box1 is 6 x 7 x 5 and Box2 is 12 x 13 x 10. Box3 = Box1 + Box2 adds each side. What is Box3's volume?", "",
+            "5400", "Sides become 18, 20 and 15.", "18 x 20 x 15 = 5400."),
+
+    // ================= Level 13: STL Lists & Maps =================
+    MCQ_Q(12, "The STL list is implemented as a ...", "",
+          "doubly linked list", "plain array", "hash table", "binary tree", 0, "Each node knows next and previous.", "std::list is a doubly linked list."),
+    MCQ_Q(12, "Which of these can you NOT do with a std::list?", "",
+          "Random access like l[3]", "push_back", "push_front", "sort", 0, "Lists are not random access.", "You reach items with iterators, front() and back(), not with an index."),
+    MCQ_Q(12, "What does splice() do?", "",
+          "Moves elements from one list into another without copying", "Copies elements", "Deletes elements", "Sorts a list", 0, "To splice is to join.", "splice relinks nodes, so no element is copied or constructed."),
+    MCQ_Q(12, "How does std::map store its keys?", "",
+          "Sorted, and each key only once", "In insertion order", "With duplicates allowed", "Unsorted", 0, "It is a sorted associative array.", "A map keeps unique keys in sorted order (it needs operator<)."),
+    MCQ_Q(12, "What prints?", "map<string, int> m;\nm[\"a\"] = 1;\nm[\"a\"] = 5;\ncout << m[\"a\"];",
+          "1", "5", "6", "It will not compile", 1, "Same key, new value.", "Entering the same key again replaces the old value."),
+    SHORT_Q(12, "Which header do you include to use list? (type the file name)", "",
+            "list|<list>|#include <list>", "Named after the container.", "#include <list>"),
+    SHORT_Q(12, "What does this print? (two numbers)", "list<int> l;\nl.push_back(50);\nl.push_back(40);\nl.push_front(10);\nl.push_front(20);\ncout << l.front() << \" \" << l.back();",
+            "20 40", "push_front adds at the start.", "The list is 20, 10, 50, 40. front is 20 and back is 40."),
+    SHORT_Q(12, "Which map method returns an iterator to a key, or end() if it is missing?", "",
+            "find|find()", "It looks for the key.", "map.find(key) returns end() when the key is absent."),
+    SHORT_Q(12, "For a map iterator iter, which member holds the VALUE? (iter->___)", "",
+            "second", "first is the key.", "iter->first is the key and iter->second is the value."),
+    SHORT_Q(12, "What does this print? (two numbers)", "map<string, int> m;\nm.insert(make_pair(\"one\", 1));\nm.insert(make_pair(\"one\", 9));\ncout << m[\"one\"] << \" \" << m.size();",
+            "1 1", "insert does NOT replace an existing key.", "The second insert fails because the key exists, so the value stays 1 and the size is 1."),
+
+    // ================= Level 14: Templates & Vectors =================
+    MCQ_Q(13, "Why use templates?", "",
+          "To reuse one function or class for many data types", "To make code always faster", "To hide code", "To avoid headers", 0, "Write it once.", "A template is a pattern the compiler reuses for different types."),
+    MCQ_Q(13, "Which line starts a template function?", "",
+          "template <typename T>", "template(T)", "generic <T>", "T template", 0, "Keyword, angle brackets, typename.", "template <typename T> introduces the placeholder type T."),
+    MCQ_Q(13, "What does the compiler do with a template?", "",
+          "Copies the code, replacing T with the real type", "Runs it as it is", "Ignores T", "Turns T into a global", 0, "It stamps out versions.", "For each type you use, the compiler generates a version with T replaced."),
+    MCQ_Q(13, "What prints?", "vector<int> v;\nv.push_back(10);\nv.push_back(20);\nv.pop_back();\ncout << v.size();",
+          "0", "1", "2", "3", 1, "pop_back removes the last item.", "Two items were added and one removed, so the size is 1."),
+    MCQ_Q(13, "Which container adapter follows LIFO (last in, first out)?", "",
+          "stack", "queue", "list", "map", 0, "Like a pile of plates.", "A stack inserts and removes at one end only."),
+    SHORT_Q(13, "Which keyword introduces a template?", "",
+            "template", "It is the word itself.", "template <typename T> ..."),
+    SHORT_Q(13, "What does this print?", "vector<int> v(10, 0);\nv.push_back(20);\ncout << v.size();",
+            "11", "Ten zeros plus one more.", "The vector starts with 10 elements and grows to 11."),
+    SHORT_Q(13, "Which vector method asks for room for n items up front, to avoid repeated reallocation?", "",
+            "reserve|reserve()", "It reserves capacity.", "reserve(n) sets the capacity to at least n."),
+    SHORT_Q(13, "Which adapter is FIFO (first in, first out): stack or queue?", "",
+            "queue", "Think of a line at a shop.", "A queue inserts at the rear and removes at the front."),
+    SHORT_Q(13, "What does this print?", "template <typename T>\nT biggest(T a, T b) { return a > b ? a : b; }\ncout << biggest(3, 8);",
+            "8", "T becomes int.", "biggest<int>(3, 8) returns the larger value, 8."),
+
+    // ================= Level 15: Lab Exam - Numbers =================
+    MCQ_Q(14, "Which test is a correct leap year check?", "",
+          "(y % 4 == 0 && y % 100 != 0) || y % 400 == 0", "y % 4 == 0", "y % 100 == 0 || y % 400 == 0", "y % 4 == 0 && y % 400 == 0", 0,
+          "Divisible by 4, but not by 100 unless also by 400.", "1900 is divisible by 4 and 100 but not 400 (not a leap year); 2000 is divisible by 400 (a leap year)."),
+    MCQ_Q(14, "To reverse the digits of n, which expression peels off the LAST digit?", "",
+          "n % 10", "n / 10", "n % 2", "n * 10", 0, "The remainder after dividing by 10.", "n % 10 is the last digit and n / 10 removes it."),
+    MCQ_Q(14, "Which of these numbers is a palindrome?", "",
+          "121", "1213", "120", "123", 0, "It reads the same backwards.", "121 reversed is 121, so it is a palindrome."),
+    MCQ_Q(14, "Why is it enough to test divisors up to sqrt(n) when checking for a prime?", "",
+          "Every factor pair has one factor no bigger than sqrt(n)", "sqrt is faster than %", "Primes are always small", "It is a rule of printf", 0, "Factors come in pairs.", "If n = a * b, then a or b is at most sqrt(n)."),
+    MCQ_Q(14, "What is binary 110 in decimal?", "",
+          "5", "6", "7", "8", 1, "4 + 2 + 0.", "110 means 1x4 + 1x2 + 0x1 = 6."),
+    SHORT_Q(14, "What does this print?", "int n = 123, r = 0;\nwhile (n > 0) {\n    r = r * 10 + n % 10;\n    n /= 10;\n}\nprintf(\"%d\", r);",
+            "321", "It builds the reversed number digit by digit.", "The loop moves the last digit of n onto the end of r: 3, 32, 321."),
+    CODE_Q(14, "Write bool isLeapYear(int year). A leap year is divisible by 4, but not by 100 unless also divisible by 400.", "bool isLeapYear(int year) {\n    \n}",
+           "int main() { if (isLeapYear(1600) && isLeapYear(2016) && isLeapYear(2000) && !isLeapYear(1700) && !isLeapYear(1900) && !isLeapYear(2023)) printf(\"PASS\"); else printf(\"FAIL\"); return 0; }",
+           "Combine the three rules with && and ||.", "Solution: return (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;"),
+    CODE_Q(14, "Write bool isAPalindrome(int n) that returns true when the digits read the same forwards and backwards.", "bool isAPalindrome(int n) {\n    \n}",
+           "int main() { if (isAPalindrome(1) && isAPalindrome(121) && isAPalindrome(1221) && !isAPalindrome(1213) && !isAPalindrome(120)) printf(\"PASS\"); else printf(\"FAIL\"); return 0; }",
+           "Reverse the number, then compare with the original.", "Solution: int copy = n, r = 0; while (copy > 0) { r = r * 10 + copy % 10; copy /= 10; } return r == n;"),
+    CODE_Q(14, "Write bool isAPrimeNumber(int n). A prime is only divisible by itself and 1 (so 0 and 1 are not prime).", "bool isAPrimeNumber(int n) {\n    \n}",
+           "int main() { if (isAPrimeNumber(2) && isAPrimeNumber(3) && isAPrimeNumber(97) && isAPrimeNumber(2147483647) && !isAPrimeNumber(4) && !isAPrimeNumber(1) && !isAPrimeNumber(0) && !isAPrimeNumber(91)) printf(\"PASS\"); else printf(\"FAIL\"); return 0; }",
+           "Try divisors from 2 while d * d <= n.", "Solution: if (n < 2) return false; for (long long d = 2; d * d <= n; d++) if (n % d == 0) return false; return true;"),
+    CODE_Q(14, "Write int convertBinarytoDecimal(int b) without the shift operator. For example 110 gives 6.", "int convertBinarytoDecimal(int b) {\n    \n}",
+           "int main() { if (convertBinarytoDecimal(110) == 6 && convertBinarytoDecimal(111) == 7 && convertBinarytoDecimal(0) == 0 && convertBinarytoDecimal(1000) == 8) printf(\"PASS\"); else printf(\"FAIL\"); return 0; }",
+           "Peel off digits with % 10 and keep a power of 2.", "Solution: int result = 0, power = 1; while (b > 0) { result += (b % 10) * power; power *= 2; b /= 10; } return result;"),
+
+    // ================= Level 16: Lab Exam - Arrays =================
+    MCQ_Q(15, "To find the 2nd largest element in one pass, you track ...", "",
+          "the largest AND second largest so far", "only the largest", "the sum", "the index of the smallest", 0, "Two variables.", "Update both values as you scan: a new largest pushes the old largest down to second."),
+    MCQ_Q(15, "Left-rotating {1, 2, 3, 4} by one position gives ...", "",
+          "{2, 3, 4, 1}", "{4, 1, 2, 3}", "{1, 2, 3, 4}", "{4, 3, 2, 1}", 0, "The first element moves to the end.", "Everything shifts left and the old first element goes to the end."),
+    MCQ_Q(15, "To insert a value at index i in an array, first you must ...", "",
+          "Shift the elements from i onwards one place to the right", "Shift them to the left", "Clear the array", "Sort the array", 0, "Make a gap. Start from the END.", "Move the tail right (from the back) to open up index i, then store the value."),
+    MCQ_Q(15, "Which nested loops print this triangle?", "A\nAA\nAAA\nAAAA",
+          "Outer i = 1..4, inner j = 1..i, print A", "Outer i = 1..4, inner j = 1..4, print A", "Outer i = 1..4, inner j = i..4, print A", "One loop that prints 4 As", 0,
+          "Row i has i letters.", "The inner loop runs i times, so row 1 has one A, row 2 has two and so on."),
+    MCQ_Q(15, "A simple solution to twoMovies(flight, movies, size) is ...", "",
+          "Check every pair i < j for movies[i] + movies[j] == flight", "Add all the movies together", "Find the longest movie", "Sort the flight length", 0, "Two nested loops.", "Try every pair of different movies; if one pair sums to the flight length, return true."),
+    SHORT_Q(15, "How many duplicate pairs does this find?", "int a[5] = {4, 7, 4, 2, 7};\nint dup = 0;\nfor (int i = 0; i < 5; i++)\n    for (int j = i + 1; j < 5; j++)\n        if (a[i] == a[j]) dup++;\nprintf(\"%d\", dup);",
+            "2", "Which values repeat?", "The 4s match once and the 7s match once, so dup is 2."),
+    CODE_Q(15, "Write int find(int size, int arr[], int toFind) that returns the index where toFind is, or -1 if it is not there.", "int find(int size, int arr[], int toFind) {\n    \n}",
+           "int main() { int a[5] = {4, 7, 1, 9, 7}; if (find(5, a, 9) == 3 && find(5, a, 4) == 0 && find(5, a, 7) == 1 && find(5, a, 5) == -1 && find(0, a, 4) == -1) printf(\"PASS\"); else printf(\"FAIL\"); return 0; }",
+           "Loop and return i the first time arr[i] matches.", "Solution: for (int i = 0; i < size; i++) if (arr[i] == toFind) return i; return -1;"),
+    CODE_Q(15, "Write int frequencyCount(int size, int arr[], int value) that counts how many times value appears.", "int frequencyCount(int size, int arr[], int value) {\n    \n}",
+           "int main() { int a[6] = {1, 2, 2, 3, 2, 5}; if (frequencyCount(6, a, 2) == 3 && frequencyCount(6, a, 5) == 1 && frequencyCount(6, a, 9) == 0 && frequencyCount(0, a, 1) == 0) printf(\"PASS\"); else printf(\"FAIL\"); return 0; }",
+           "Add 1 to a counter for every match.", "Solution: int c = 0; for (int i = 0; i < size; i++) if (arr[i] == value) c++; return c;"),
+    CODE_Q(15, "Write int find2ndLargest(int size, int arr[]) for positive ints. Return -1 if there is no second largest.", "int find2ndLargest(int size, int arr[]) {\n    \n}",
+           "int main() { int a[5] = {3, 9, 2, 8, 5}; int b[2] = {1, 2}; int c[1] = {5}; if (find2ndLargest(5, a) == 8 && find2ndLargest(2, b) == 1 && find2ndLargest(1, c) == -1) printf(\"PASS\"); else printf(\"FAIL\"); return 0; }",
+           "Keep a largest and a second, both starting at -1.", "Solution: int big = -1, second = -1; for (int i = 0; i < size; i++) { if (arr[i] > big) { second = big; big = arr[i]; } else if (arr[i] < big && arr[i] > second) second = arr[i]; } return second;"),
+    CODE_Q(15, "Write bool twoMovies(int flightLength, int movieLengths[], int size): true if exactly two DIFFERENT movies add up to the flight length.", "bool twoMovies(int flightLength, int movieLengths[], int size) {\n    \n}",
+           "int main() { int m[4] = {90, 120, 60, 100}; if (twoMovies(150, m, 4) && twoMovies(220, m, 4) && !twoMovies(200, m, 4) && !twoMovies(240, m, 4) && !twoMovies(100, m, 1)) printf(\"PASS\"); else printf(\"FAIL\"); return 0; }",
+           "Two loops, with j starting after i.", "Solution: for (int i = 0; i < size; i++) for (int j = i + 1; j < size; j++) if (movieLengths[i] + movieLengths[j] == flightLength) return true; return false;"),
+
+    // ================= Level 17: Lab Exam - Grids & Text =================
+    MCQ_Q(16, "In the cluster game, which check happens first at each cell?", "",
+          "A horizontal line of 3+ identical items", "A vertical line", "A diagonal line", "A random check", 0, "Horizontal, then vertical.", "The scan checks horizontally first, and only if that fails does it check vertically."),
+    MCQ_Q(16, "Which values are NEVER part of a cluster?", "",
+          "0 and -2", "1 and 2", "3 and 4", "-1 only", 0, "Empty and new items.", "0's and -2's are never part of a cluster."),
+    MCQ_Q(16, "After a cluster is replaced with -1, what does FallDownAndReplace do?", "",
+          "Items above fall down and new -2 items fill the top", "It deletes the array", "It sorts every row", "It adds 1 to every cell", 0, "Gravity, column by column.", "Each column drops items into the gaps and new items (-2) appear at the top."),
+    MCQ_Q(16, "In FindAllVariablesInScope, what is used to track scope?", "",
+          "A brace depth counter ({ adds 1, } subtracts 1)", "A for loop counter", "printf", "sizeof", 0, "Count the curly brackets.", "A variable declared at depth D is in scope as long as the current depth is at least D."),
+    MCQ_Q(16, "wordCounter counts a new word when ...", "",
+          "a letter appears right after a space (or at the start)", "every space is seen", "every letter is seen", "every comma is seen", 0, "Look for the start of each word.", "A word starts where a letter follows a space or the beginning of the text."),
+    SHORT_Q(16, "What is printed?", "int grid[2][3] = {{1, 1, 1}, {2, 3, 4}};\nint sum = 0;\nfor (int c = 0; c < 3; c++) sum += grid[0][c];\nprintf(\"%d\", sum);",
+            "3", "Only row 0 is added.", "Row 0 is {1, 1, 1}, which adds up to 3."),
+    SHORT_Q(16, "How many As are printed in total by this code?", "for (int i = 1; i <= 4; i++) {\n    for (int j = 0; j < i; j++) putchar('A');\n    putchar('\\n');\n}",
+            "10", "1 + 2 + 3 + 4.", "Rows of 1, 2, 3 and 4 As give 10."),
+    CODE_Q(16, "Write int wordCounter(int size, char characters[]) that counts words made of letters A-Z or a-z separated by spaces.", "int wordCounter(int size, char characters[]) {\n    \n}",
+           "int main() { char a[] = \"hello world\"; char b[] = \"  a  b c \"; char c[] = \"\"; char d[] = \"one\"; if (wordCounter(11, a) == 2 && wordCounter(9, b) == 3 && wordCounter(0, c) == 0 && wordCounter(3, d) == 1) printf(\"PASS\"); else printf(\"FAIL\"); return 0; }",
+           "Count every time a letter follows a space or the start.", "Solution: int count = 0; bool inWord = false; for (int i = 0; i < size; i++) { char c = characters[i]; bool letter = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'); if (letter && !inWord) count++; inWord = letter; } return count;"),
+    CODE_Q(16, "Write void rotateLeft(int size, int arr[]) that moves the first element to the end and shifts the rest left.", "void rotateLeft(int size, int arr[]) {\n    \n}",
+           "int main() { int a[4] = {1, 2, 3, 4}; int b[1] = {9}; rotateLeft(4, a); rotateLeft(1, b); if (a[0] == 2 && a[1] == 3 && a[2] == 4 && a[3] == 1 && b[0] == 9) printf(\"PASS\"); else printf(\"FAIL\"); return 0; }",
+           "Save arr[0], shift everything left, put it at the end.", "Solution: if (size < 2) return; int first = arr[0]; for (int i = 0; i < size - 1; i++) arr[i] = arr[i + 1]; arr[size - 1] = first;"),
+    CODE_Q(16, "Write bool insertElement(int arr[], int *count, int size, int value, int index): insert value at index, shifting right. Fail if the array is full or index is invalid.", "bool insertElement(int arr[], int *count, int size, int value, int index) {\n    \n}",
+           "int main() { int a[5] = {1, 2, 3, 0, 0}; int n = 3; bool ok = insertElement(a, &n, 5, 9, 1); bool bad = insertElement(a, &n, 5, 7, 9); if (ok && !bad && n == 4 && a[0] == 1 && a[1] == 9 && a[2] == 2 && a[3] == 3) printf(\"PASS\"); else printf(\"FAIL\"); return 0; }",
+           "Check the bounds first, then shift from the back.", "Solution: if (*count >= size || index < 0 || index > *count) return false; for (int i = *count; i > index; i--) arr[i] = arr[i - 1]; arr[index] = value; (*count)++; return true;"),
 };
 #define QUESTION_BANK_SIZE ((int)(sizeof(questionBank) / sizeof(questionBank[0])))
 
 // ================================================================ stage names, study notes and flashcards
 // Fun district names for each map (C / C++ jokes with a cyberpunk twist).
 static const char *stageNames[MODE_COUNT][LEVEL_COUNT] = {
-    { "Boot Sector", "Operator Overpass", "Infinite Loop Lane", "Null-Terminator Alley", "Function Foundry" },
-    { "Cursor Cove", "Semicolon Strip", "Segfault Slums", "Stack Overflow Heights", "Main() Megatower" },
+    { "Boot Sector", "Operator Overpass", "Infinite Loop Lane", "Null-Terminator Alley", "Function Foundry",
+      "Pointer Plaza", "Address Arcade", "Pointer Pit-Stop", "Heap Heights", "Link-List Lagoon",
+      "Class Act Quarter", "Overload Overpass", "STL Station", "Template Terrace",
+      "Prime Time Square", "Array Arena", "Grid Lock Tower" },
+    { "Cursor Cove", "Semicolon Strip", "Segfault Slums", "Stack Overflow Heights", "Compiler Corner",
+      "Dangling Docks", "Deref District", "Strcpy Station", "Malloc Market", "Next-Node Network",
+      "Constructor Court", "Operator Outpost", "Iterator Isles", "Generic Gardens",
+      "Leap-Year Lounge", "Index Island", "Main() Megatower" },
 };
 
 // Notes: every string starts with a tag. '#' heading, '~' paragraph, '-' bullet, '>' code line, '' (empty) = gap.
@@ -265,6 +660,11 @@ static const char *notes0[] = {
     "#const",
     "~Put const in front of a declaration to make the variable read-only. Trying to change it is a compile error. (final and constant are NOT C keywords.)",
     ">const double TAX_RATE = 0.08;",
+    "#Reading input with scanf",
+    "~scanf reads what the user types. It needs the ADDRESS of the variable, so put & in front of it.",
+    ">int age;",
+    ">scanf(\"%d\", &age);   // forgetting the & is a classic bug",
+    "-Include <stdio.h> to use printf and scanf.",
 };
 static const char *notes1[] = {
     "#Arithmetic operators",
@@ -310,6 +710,13 @@ static const char *notes2[] = {
     ">    if (i % 2 == 0) continue;  // skip evens",
     ">    printf(\"%d \", i);          // 1 3 5",
     ">}",
+    "#switch",
+    "~A switch compares one value against several case labels. Each case should end with break, otherwise execution falls through into the next case.",
+    ">switch (n) {",
+    ">    case 1: printf(\"one\"); break;",
+    ">    case 2: printf(\"two\"); break;",
+    ">    default: printf(\"other\");",
+    ">}",
 };
 static const char *notes3[] = {
     "#Arrays",
@@ -327,6 +734,11 @@ static const char *notes3[] = {
     ">int len = 0;",
     ">while (name[len] != '\\0') len++;   // len is 5",
     "-Always leave room for the extra '\\0' character.",
+    "#2D arrays",
+    "~A 2D array is a grid. The first index is the row, the second is the column, and both start at 0.",
+    ">int grid[2][3] = {{1, 2, 3}, {4, 5, 6}};",
+    ">printf(\"%d\", grid[1][2]);   // 6",
+    "-Use two nested for loops to visit every cell.",
 };
 static const char *notes4[] = {
     "#Functions",
@@ -347,13 +759,11 @@ static const char *notes4[] = {
     ">return sum;",
     "#How the Function Lab works",
     "~Your code is compiled with gcc and tested against several inputs. If every test prints PASS you win the question.",
+    "#Pass by value",
+    "~In C every argument is COPIED into the parameter. If a function changes its parameter, the caller's variable is NOT changed.",
+    ">void addOne(int n) { n = n + 1; }   // x stays the same",
+    "-A function prototype tells the compiler a function's signature before it is called. Put it above main.",
 };
-static const char **noteLines[LEVEL_COUNT] = { notes0, notes1, notes2, notes3, notes4 };
-static const int noteCounts[LEVEL_COUNT] = {
-    (int)(sizeof notes0 / sizeof notes0[0]), (int)(sizeof notes1 / sizeof notes1[0]), (int)(sizeof notes2 / sizeof notes2[0]),
-    (int)(sizeof notes3 / sizeof notes3[0]), (int)(sizeof notes4 / sizeof notes4[0]),
-};
-
 typedef struct { const char *front, *back; } Flashcard;
 static const Flashcard cards0[] = {
     { "variable", "A named place in memory that stores a value of a certain type." },
@@ -405,12 +815,6 @@ static const Flashcard cards4[] = {
     { "running total", "Start with sum = 0, add each element in a loop, then return sum." },
     { "isEven(n)", "return n % 2 == 0; gives 1 for even numbers and 0 for odd ones." },
 };
-static const Flashcard *cardSets[LEVEL_COUNT] = { cards0, cards1, cards2, cards3, cards4 };
-static const int cardCounts[LEVEL_COUNT] = {
-    (int)(sizeof cards0 / sizeof cards0[0]), (int)(sizeof cards1 / sizeof cards1[0]), (int)(sizeof cards2 / sizeof cards2[0]),
-    (int)(sizeof cards3 / sizeof cards3[0]), (int)(sizeof cards4 / sizeof cards4[0]),
-};
-
 // Boosters earned at HP milestones.
 typedef enum { BOOST_FIFTY, BOOST_SHIELD, BOOST_DOUBLE, BOOST_COUNT } BoostId;
 static const char *boostShort[BOOST_COUNT] = { "50/50", "SHIELD", "2x HP" };
@@ -419,14 +823,521 @@ static const char *boostLong[BOOST_COUNT] = {
     "SHIELD: your next wrong answer is forgiven. No mistake is recorded.",
     "2x HP: everything you earn for the rest of this level is doubled.",
 };
-#define MILESTONE_COUNT 7
-static const int milestoneHp[MILESTONE_COUNT] = { 40, 100, 180, 280, 400, 550, 750 };
+#define MILESTONE_COUNT 14
+static const int milestoneHp[MILESTONE_COUNT] = { 40, 100, 180, 280, 400, 550, 750, 1000, 1300, 1650, 2050, 2500, 3000, 3600 };
 static const int milestoneReward[MILESTONE_COUNT][BOOST_COUNT] = {
     { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 }, { 2, 0, 0 }, { 0, 1, 1 }, { 0, 2, 0 }, { 1, 1, 1 },
+    { 1, 0, 1 }, { 0, 1, 0 }, { 2, 0, 0 }, { 0, 1, 1 }, { 1, 1, 0 }, { 0, 2, 1 }, { 2, 2, 2 },
 };
-#define RANK_COUNT 6
-static const int rankHp[RANK_COUNT] = { 0, 60, 150, 300, 500, 800 };
-static const char *rankNames[RANK_COUNT] = { "Rookie Coder", "Script Kid", "Byte Runner", "Netrunner", "Kernel Knight", "Root Admin" };
+#define RANK_COUNT 8
+static const int rankHp[RANK_COUNT] = { 0, 60, 150, 300, 500, 800, 1400, 2200 };
+static const char *rankNames[RANK_COUNT] = { "Rookie Coder", "Script Kid", "Byte Runner", "Netrunner", "Kernel Knight", "Root Admin", "Cyber Sage", "Grand Compiler" };
+
+// ---- wardrobe: one accessory is unlocked together with each booster milestone
+typedef enum { SLOT_HEAD, SLOT_FACE, SLOT_NECK, SLOT_BACK } AccSlot;
+typedef enum { ACC_CAP, ACC_SHADES, ACC_BOWTIE, ACC_WIZARD, ACC_CAPE, ACC_NERD, ACC_PHONES,
+               ACC_SCARF, ACC_VISOR, ACC_TOPHAT, ACC_JETPACK, ACC_MEDAL, ACC_WINGS, ACC_PROP } AccId;
+typedef struct { const char *name; int slot; const char *blurb; } Accessory;
+static const char *slotNames[SLOT_COUNT] = { "HEAD", "FACE", "NECK", "BACK" };
+// Accessory i is the reward for milestone i (see milestoneHp).
+static const Accessory accessories[ACC_COUNT] = {
+    { "Cap",            SLOT_HEAD, "A sporty cap, worn the cool way." },
+    { "Cool Shades",    SLOT_FACE, "Dark glasses for a bright future." },
+    { "Bow Tie",        SLOT_NECK, "Very fancy. Very formal." },
+    { "Wizard Hat",     SLOT_HEAD, "Pointy, starry and full of magic." },
+    { "Hero Cape",      SLOT_BACK, "Every coder needs a cape." },
+    { "Nerd Glasses",   SLOT_FACE, "Big round lenses for big ideas." },
+    { "Headphones",     SLOT_HEAD, "Coding is better with music." },
+    { "Scarf",          SLOT_NECK, "Cosy for the cold server room." },
+    { "Cyber Visor",    SLOT_FACE, "A glowing teal visor from the future." },
+    { "Top Hat",        SLOT_HEAD, "Tip of the hat to you." },
+    { "Jetpack",        SLOT_BACK, "Boosters! Real ones!" },
+    { "Gold Medal",     SLOT_NECK, "Awarded for serious studying." },
+    { "Angel Wings",    SLOT_BACK, "Light as a well-optimised loop." },
+    { "Propeller Beanie", SLOT_HEAD, "It actually spins." },
+};
+// ================================================================ notes + flashcards for modules 6 to 17 (pointers, memory, C++ and exam prep)
+static const char *notes5[] = {
+    "#Memory has addresses",
+    "~Computer memory is a long row of slots. Every slot has a unique address, and a variable is just a named slot (or a few slots) holding a value.",
+    "#What is a pointer?",
+    "~A pointer is a variable that stores the ADDRESS of another variable. It does not hold the value itself.",
+    ">int i = 5;",
+    ">int *ptr;        // ptr can hold the address of an int",
+    ">ptr = &i;        // store the address of i in ptr",
+    ">*ptr = 10;       // follow the address: i is now 10",
+    "#The twin operators",
+    "-& is the address-of operator. &i means 'where i lives'.",
+    "-* is the dereference operator. *ptr means 'the thing ptr points at'. You can read it or write to it.",
+    "~Careful: in a declaration (int *ptr) the star just means 'this is a pointer'. In an expression (*ptr = 3) it means dereference.",
+    "#Re-pointing a pointer",
+    ">int i = 5, j = 10;",
+    ">int *p = &i;",
+    ">*p = 3;          // i is 3",
+    ">p = &j;          // p now points at j",
+    ">*p = -2;         // j is -2, i is still 3",
+    "#Pointer to pointer",
+    "~A pointer can point at another pointer. This is called double indirection.",
+    ">int **pp = &p;   // pp holds the address of p",
+    ">**pp = 7;        // follow two arrows to reach the int",
+    "#NULL",
+    "~A pointer that points at nothing should be set to NULL (nullptr in C++). Never dereference a NULL pointer: the program crashes (segfault).",
+};
+static const char *notes6[] = {
+    "#Pass by value (a quick recap)",
+    "~C copies arguments into parameters. If a function changes its parameter, only the copy changes.",
+    ">void f(int j) { j = 5; }     // caller's variable is untouched",
+    "#Pass by pointer",
+    "~To let a function change the caller's variable, pass its ADDRESS and write through the pointer.",
+    ">void f(int *ptr) { *ptr = 5; }",
+    ">int i = 3;",
+    ">f(&i);           // i is now 5",
+    "#The classic swap",
+    ">void swap_ints(int *a, int *b) {",
+    ">    int temp = *a;",
+    ">    *a = *b;",
+    ">    *b = temp;",
+    ">}",
+    ">swap_ints(&x, &y);   // pass the addresses",
+    "#Pointer arithmetic",
+    "-ptr + 1 is the NEXT element (it moves by the size of the type), ptr - 1 is the previous one.",
+    "-ptr * 2 and ptr / 2 are invalid. You can only add or subtract whole numbers.",
+    "-An array name is the address of its first element, so arr + i is the address of arr[i].",
+    ">int a[4] = {2, 4, 6, 8};",
+    ">int *p = a;      // same as &a[0]",
+    ">*(p + 2)         // 6, exactly the same as a[2]",
+    ">p++;             // p now points at a[1]",
+    "#Function pointers",
+    "~You can store the address of a function in a function pointer and call it indirectly. You cannot do arithmetic on function pointers.",
+    ">int Add(int a, int b) { return a + b; }",
+    ">int (*functionPtr)(int, int);   // same types as Add",
+    ">functionPtr = Add;",
+    ">int result = functionPtr(20, 10);   // 30",
+};
+static const char *notes7[] = {
+    "#The pointer lab rules",
+    "~The pointer lab has ten functions. The big rule: NO array indexing like arr[i] inside them. Use pointers and pointer arithmetic only.",
+    "#Walking a string",
+    "~Every C string ends with '\\0', so loop until the pointer sees it.",
+    ">int strlen_ptr(char *str) {",
+    ">    int n = 0;",
+    ">    while (*str != '\\0') { n++; str++; }",
+    ">    return n;",
+    ">}",
+    "#Walking an array",
+    ">int sum_array(int *arr, int size) {",
+    ">    int s = 0;",
+    ">    for (int i = 0; i < size; i++) s += *(arr + i);",
+    ">    return s;",
+    ">}",
+    "#find_max and reverse_array",
+    "-find_max: start with the first element, compare every other element, keep the biggest.",
+    "-reverse_array: one pointer at the start, one at the end. Swap *left and *right, then left++ and right-- until they meet.",
+    "#Copy, concatenate, compare",
+    "-copy_string: copy each char until you reach '\\0', then store a '\\0' in dest yourself.",
+    "-concat_strings: first move dest forward to its '\\0', then copy src onto the end.",
+    "-compare_strings: walk both strings while the chars match; return the difference of the first chars that differ. Negative means the first string is smaller.",
+    "#count_vowels",
+    "~Walk the string and add 1 whenever the char is a, e, i, o or u (upper or lower case).",
+};
+static const char *notes8[] = {
+    "#Stack and heap",
+    "-Local variables live on the stack. They disappear when their function ends.",
+    "-The heap holds memory that YOU ask for. It stays until you give it back.",
+    "#new and delete (C++)",
+    ">int *ptr = new int;     // ask the heap for one int",
+    ">*ptr = 42;",
+    ">delete ptr;             // give it back",
+    "~Every new needs exactly one delete. Forget it and you have a memory leak.",
+    "#Dynamic arrays",
+    "~Arrays on the stack need a constant size. With new[] the size can be decided while the program runs.",
+    ">int numItems;",
+    ">cin >> numItems;",
+    ">int *arr = new int[numItems];",
+    ">delete[] arr;           // arrays use delete[]",
+    "#Three classic mistakes",
+    "-Memory leak: you lose the pointer, or never delete.",
+    "-Dangling pointer: you use memory after it was deleted. Set the pointer to NULL after deleting.",
+    "-Double delete: deleting the same memory twice.",
+    "-Also: only delete memory that came from new. Never delete the address of a normal variable.",
+    "#2D dynamic arrays",
+    ">int **arr2D = new int*[rows];",
+    ">for (int r = 0; r < rows; r++) arr2D[r] = new int[cols];",
+    "~Delete in the reverse order: every row with delete[], then the array of rows.",
+    "#malloc and free (C)",
+    ">int *ptr = (int*)malloc(sizeof(int));",
+    ">if (ptr == NULL) { /* allocation failed */ }",
+    ">*ptr = 42;",
+    ">free(ptr);",
+    "-Always check malloc for NULL, use sizeof for the size, call free once per malloc, and never use memory after freeing it.",
+    "#Global variables",
+    "~A global is visible everywhere. A local with the same name hides the global: changing the local leaves the global untouched.",
+};
+static const char *notes9[] = {
+    "#The idea",
+    "~A linked list is a chain of nodes. Each node holds some data and a pointer to the next node. The last node's next is nullptr. The head pointer points at the first node.",
+    ">struct Node {",
+    ">    int data;",
+    ">    Node *next;",
+    ">};",
+    "#Walking the list",
+    ">Node *p = head;",
+    ">while (p != nullptr) {",
+    ">    cout << p->data << \" \";",
+    ">    p = p->next;",
+    ">}",
+    "~p->data is shorthand for (*p).data.",
+    "#Insert at the front",
+    ">Node *n = new Node;",
+    ">n->data = 7;",
+    ">n->next = head;    // new node points at the old head",
+    ">head = n;          // and becomes the new head",
+    "#Insert at the end",
+    "~Walk to the last node (the one whose next is nullptr), then link the new node after it. If the list is empty the new node simply becomes the head.",
+    "#Delete the head",
+    ">Node *temp = head;",
+    ">head = head->next;",
+    ">delete temp;",
+    "#Doubly linked lists",
+    "~Each node also has a prev pointer, so you can walk backwards. Inserting and deleting means fixing both next and prev pointers.",
+    "#A List class",
+    "-Wrap the head pointer in a class with methods like insert, remove and print.",
+    "-Destructor: walks the list and deletes every node.",
+    "-Copy constructor and assignment operator: build NEW nodes (a deep copy). The default copy only copies the head pointer, so two lists would share nodes.",
+};
+static const char *notes10[] = {
+    "#Why classes?",
+    "~Passing a vector's four doubles around separately is messy. A class groups related data into one new type.",
+    "#Defining a class",
+    ">class Point {",
+    ">public:",
+    ">    double x, y;",
+    ">};                     // do not forget this semicolon!",
+    "-The variables inside are fields (or members).",
+    "-A class can contain other classes as fields.",
+    ">class Vector {",
+    ">public:",
+    ">    Point start, end;",
+    ">};",
+    "#Instances",
+    ">Vector vec;                // vec is an instance of Vector",
+    ">vec.start.x = 1.2;         // dot operator reaches the fields",
+    "~Assigning one instance to another copies every field.",
+    "#Passing objects to functions",
+    "-By value: a copy is passed, changes are lost.",
+    "-By reference (Point &p): the original is changed.",
+    "-By pointer (Point *p): use p->x to reach the fields.",
+    ">void offsetPoint(Point &p, double dx) { p.x += dx; }",
+    "#Methods",
+    "~Functions that belong to a class are methods (member functions). They automatically know the current object, which is available as the this pointer.",
+    ">vec.print();",
+    ">vec.offset(1.0, 1.5);",
+};
+static const char *notes11[] = {
+    "#Function overloading",
+    "~You can have several functions with the same name if their parameters differ in type or number. The return type alone is not enough.",
+    ">void print(int i);",
+    ">void print(double f);",
+    ">void print(char *c);",
+    ">print(5);       // calls print(int)",
+    ">print(500.263); // calls print(double)",
+    "#Operator overloading",
+    "~Most built-in operators can be redefined for your own classes. An overloaded operator is a function named operator followed by the symbol.",
+    ">Box operator+(const Box& b);",
+    "#Member version",
+    ">Box operator+(const Box& b) {",
+    ">    Box box;",
+    ">    box.length = this->length + b.length;",
+    ">    box.breadth = this->breadth + b.breadth;",
+    ">    box.height = this->height + b.height;",
+    ">    return box;",
+    ">}",
+    "-In Box3 = Box1 + Box2, Box1 calls operator+, so this points at Box1 and b is Box2.",
+    "#Non-member version",
+    "~A normal function has no this, so it takes BOTH operands.",
+    ">Box operator+(const Box&, const Box&);",
+    "#Why const Box& ?",
+    "-The & means no copy is made.",
+    "-The const promises the function will not change the argument.",
+    "#Example",
+    "~Box1 is 6x7x5 and Box2 is 12x13x10. Box3 = Box1 + Box2 is 18x20x15, so its volume is 5400.",
+};
+static const char *notes12[] = {
+    "#std::list",
+    "~The STL list is a doubly linked list. It is a sequence you can walk in both directions, but it is NOT random access: no l[3]. Use iterators, front() and back().",
+    ">list<int> l;",
+    ">l.push_back(50);   l.push_back(40);",
+    ">l.push_front(10);  l.push_front(20);    // 20 10 50 40",
+    ">l.sort();                              // 10 20 40 50",
+    "#Iterators",
+    ">list<int>::iterator it;",
+    ">for (it = l.begin(); it != l.end(); ++it)",
+    ">    (*it) *= 2;      // double every item",
+    "#splice",
+    "~To splice means to join. splice moves elements from one list into another without copying or constructing anything. The iterators of the moved elements are no longer valid.",
+    "-splice(position, x) moves all of x.",
+    "-splice(position, x, i) moves one element.",
+    "-splice(position, x, first, last) moves a range.",
+    "#std::map",
+    "~A map stores key/value pairs. The keys are unique and sorted (they need operator<). It is like a fast look-up table, e.g. host names to IP addresses.",
+    ">#include <map>",
+    ">map<string, int> freq;",
+    ">freq[\"One\"] = 1;        // [] as an lvalue inserts",
+    ">int v = freq[\"One\"];    // [] as an rvalue retrieves",
+    ">freq[\"One\"] = 134;      // same key: the value is replaced",
+    ">freq.erase(\"One\");      // remove a pair",
+    "#find and insert",
+    ">map<string,int>::iterator it = freq.find(\"One\");",
+    ">if (it != freq.end()) cout << it->first << it->second;",
+    "-find returns end() when the key is missing. it->first is the key, it->second is the value.",
+    "-insert(make_pair(k, v)) does NOT replace an existing key. Its result's .second is false when the key already existed.",
+    "#unordered_map",
+    "~C++11 adds unordered_map, which uses a hash table. Keys are not sorted.",
+};
+static const char *notes13[] = {
+    "#Templates",
+    "~A template is a pattern that lets one function or class work with many types. Without it you would copy the same code for int, float, double...",
+    ">template <typename T>",
+    ">T sum(T const* pArray, int const ELEMENTS) {",
+    ">    T sum = 0;",
+    ">    for (int i = 0; i < ELEMENTS; i++) sum += pArray[i];",
+    ">    return sum;",
+    ">}",
+    "~When you call sum(intArray, 10) the compiler copies the code and replaces every T with int. Call it with floats and you get a float version.",
+    "#The STL",
+    "-Sequence containers: vector, list, deque.",
+    "-Associative containers: map, set (look up by key).",
+    "-Container adapters: stack (LIFO) and queue (FIFO).",
+    "-Algorithms (<algorithm>): sort, find and over 70 more.",
+    "-Iterators connect containers and algorithms.",
+    "#vector",
+    "~A vector is a dynamic array: it grows and shrinks as needed.",
+    ">vector<int> v;",
+    ">v.push_back(10);   v.push_back(20);",
+    ">v[0] = v.at(1);    // [] and at() both index",
+    ">v.pop_back();      // remove the last item",
+    ">int n = v.size();",
+    "#size versus capacity",
+    "~Size is how many items are stored. Capacity is how many fit in the memory already allocated. When a push_back exceeds the capacity, the vector allocates a bigger block (usually double), copies everything across and frees the old block.",
+    "-reserve(n) asks for room for n items up front to avoid repeated reallocation.",
+    "#stack and queue",
+    "-stack: push and pop at one end only. Last In, First Out.",
+    "-queue: push at the rear, pop at the front. First In, First Out.",
+};
+static const char *notes14[] = {
+    "#Leap years",
+    "~A year is a leap year if it is divisible by 4, except century years, which must also be divisible by 400.",
+    ">bool isLeapYear(int y) {",
+    ">    return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;",
+    ">}",
+    "-1600 and 2016 are leap years. 1700 and 1900 are not.",
+    "#Digits with % and /",
+    "-n % 10 is the last digit.",
+    "-n / 10 removes the last digit.",
+    "#Reverse a number and palindromes",
+    ">int Reversed(int n) {",
+    ">    int r = 0;",
+    ">    while (n > 0) { r = r * 10 + n % 10; n /= 10; }",
+    ">    return r;",
+    ">}",
+    "~123 becomes 321. A palindrome reads the same backwards (like 121), so isAPalindrome(n) is just n == Reversed(n).",
+    "#Prime numbers",
+    "~A prime is only divisible by 1 and itself. 0 and 1 are not prime. You only need to test divisors d with d * d <= n.",
+    ">for (long long d = 2; d * d <= n; d++)",
+    ">    if (n % d == 0) return false;",
+    "#Binary to decimal (no shifts)",
+    "~Binary 110 means 1x4 + 1x2 + 0x1 = 6. Peel digits off with % 10 and keep doubling a power.",
+    ">int result = 0, power = 1;",
+    ">while (b > 0) { result += (b % 10) * power; power *= 2; b /= 10; }",
+};
+static const char *notes15[] = {
+    "#Searching",
+    "-find: loop and return the index of the first match, or -1.",
+    "-frequencyCount: add 1 to a counter for every match.",
+    "-countDuplicates: for every pair i < j with equal values add 1.",
+    "#The 2nd largest element",
+    "~Track the largest and the second largest as you scan once. A bigger value pushes the old largest down to second place.",
+    ">if (a[i] > big) { second = big; big = a[i]; }",
+    ">else if (a[i] < big && a[i] > second) second = a[i];",
+    "#Copy, reverse and rotate",
+    "-copyArraytoArray: arr2[i] = arr1[i] for every i.",
+    "-reverse with one array: swap a[i] with a[size - 1 - i] for the first half only.",
+    "-rotateLeft: save a[0], shift every element one place left, put the saved value at the end.",
+    "#Insert and delete",
+    "-Insert at index: move elements from the back, one place right, to open a gap; store the value; count++.",
+    "-Delete at index: move every later element one place left; count--.",
+    "-count is how many elements are used, size is how many fit. Refuse when full or when the index is invalid.",
+    "#Two movies puzzle",
+    "~Given a flight length and the movie lengths, are there exactly two different movies that add up to it? Check every pair with j starting after i, so a movie is never counted twice.",
+    ">for (int i = 0; i < size; i++)",
+    ">    for (int j = i + 1; j < size; j++)",
+    ">        if (m[i] + m[j] == flight) return true;",
+    ">return false;",
+};
+static const char *notes16[] = {
+    "#Printing triangles",
+    "~Right-angled triangle: row i prints i letters.",
+    ">for (int i = 1; i <= 4; i++) {",
+    ">    for (int j = 0; j < i; j++) printf(\"A\");",
+    ">    printf(\"\\n\");",
+    ">}",
+    "~The isosceles/diamond version goes 1, 2, 3, 4, 3, 2, 1. Two loops and one if/else, or two loops with no conditions by using a clever length formula.",
+    "#Counting words",
+    "~A word is a run of letters (A-Z or a-z) separated by spaces. Count each time a letter follows a non-letter (or the start).",
+    "#PrintArray",
+    "~The 4x6 array is printed row by row with two nested loops. In the exam only PrintArray may use printf.",
+    "#ReplaceWithMinusOne (cluster scoring)",
+    "-Scan from (0,0), left to right across each row.",
+    "-At each cell check a HORIZONTAL line of 3+ identical items first, then a VERTICAL line.",
+    "-The first cluster found is scored by adding up its values (1-4), then replaced with -1.",
+    "-0 and -2 are never part of a cluster.",
+    "#FallDownAndReplace",
+    "~Works column by column. Items above a -1 fall down into the gap, and new items at the top get the value -2 (they are not part of the next cluster).",
+    "#FindAllVariables",
+    "~Scan the code string. Every line that declares an int or char adds its variable name to a comma-separated list, e.g. int var1=10; adds var1.",
+    "#FindAllVariablesInScope",
+    "~Track scope with a brace depth counter: { adds 1 and } subtracts 1. A variable declared at depth D is in scope after its line as long as the depth stays at least D.",
+};
+
+static const char **noteLines[LEVEL_COUNT] = {
+    notes0, notes1, notes2, notes3, notes4, notes5, notes6, notes7, notes8, notes9, notes10, notes11, notes12, notes13, notes14, notes15, notes16
+};
+#define NOTE_COUNT(a) ((int)(sizeof a / sizeof a[0]))
+static const int noteCounts[LEVEL_COUNT] = {
+    NOTE_COUNT(notes0), NOTE_COUNT(notes1), NOTE_COUNT(notes2), NOTE_COUNT(notes3), NOTE_COUNT(notes4), NOTE_COUNT(notes5), NOTE_COUNT(notes6),
+    NOTE_COUNT(notes7), NOTE_COUNT(notes8), NOTE_COUNT(notes9), NOTE_COUNT(notes10), NOTE_COUNT(notes11), NOTE_COUNT(notes12), NOTE_COUNT(notes13),
+    NOTE_COUNT(notes14), NOTE_COUNT(notes15), NOTE_COUNT(notes16)
+};
+
+static const Flashcard cards5[] = {
+    { "pointer", "A variable that stores the memory ADDRESS of another variable." },
+    { "&  (address-of)", "Gets the address of a variable. &i is where i lives in memory." },
+    { "*  (dereference)", "Follows a pointer to the thing it points at. *ptr reads or writes that value." },
+    { "int *ptr;", "Declares ptr as a pointer to an int. Here the star just marks it as a pointer." },
+    { "ptr = &i;", "Stores the address of i in ptr. ptr now points at i." },
+    { "int **pp", "A pointer to a pointer (double indirection). **pp reaches the int." },
+    { "NULL / nullptr", "The value of a pointer that points at nothing. Never dereference it." },
+    { "ptr vs *ptr", "ptr is the address stored in the pointer. *ptr is the value at that address." },
+};
+static const Flashcard cards6[] = {
+    { "pass by value", "The function gets a copy. Changing the parameter does not change the caller's variable." },
+    { "pass by pointer", "Pass &x so the function can change x through *ptr." },
+    { "swap_ints(&x, &y)", "You pass addresses so the function can swap the original variables." },
+    { "ptr + 1", "The address of the NEXT element (moves by the size of the type)." },
+    { "*(arr + i)", "Exactly the same as arr[i]." },
+    { "array name", "Acts as the address of its first element: arr is &arr[0]." },
+    { "invalid pointer maths", "You can add and subtract whole numbers, but ptr * 2 and ptr / 2 are invalid." },
+    { "function pointer", "Stores the address of a function, e.g. int (*fp)(int, int); You cannot do arithmetic on it." },
+};
+static const Flashcard cards7[] = {
+    { "pointer lab rule", "No array indexing like arr[i]. Use pointer arithmetic only." },
+    { "strlen_ptr", "Walk a char pointer until it sees '\\0', counting steps." },
+    { "reverse_array", "Swap *left and *right, then left++ and right-- until they meet." },
+    { "find_max", "Start with the first element, update the maximum whenever a bigger one appears." },
+    { "copy_string", "Copy chars until '\\0', then write a '\\0' into dest yourself." },
+    { "concat_strings", "Move dest to its '\\0', then copy src onto the end." },
+    { "compare_strings", "Return the difference of the first differing chars. Negative means the first string is smaller." },
+    { "count_vowels", "Walk the string and count a, e, i, o, u in either case." },
+};
+static const Flashcard cards8[] = {
+    { "stack", "Memory for local variables. It is cleaned up automatically when the function ends." },
+    { "heap", "Memory you request with new or malloc. It lasts until you free it." },
+    { "new / delete", "C++ allocate and release. Every new needs one delete." },
+    { "new[] / delete[]", "Allocate and release arrays. The size can be chosen at run time." },
+    { "malloc / free", "The C way: malloc(size) and free(ptr). Check malloc for NULL." },
+    { "memory leak", "Heap memory that was never freed, so it is wasted until the program ends." },
+    { "dangling pointer", "A pointer to memory that was already freed. Using it is undefined behaviour." },
+    { "double delete", "Deleting the same memory twice. Never do it. Only delete what came from new." },
+};
+static const Flashcard cards9[] = {
+    { "node", "One element of a list: the data plus a pointer to the next node." },
+    { "head", "A pointer to the first node. An empty list has head == nullptr." },
+    { "next", "The pointer inside a node that links to the following node." },
+    { "p->data", "Shorthand for (*p).data: the data of the node p points to." },
+    { "insert at front", "n->next = head; head = n;" },
+    { "delete the head", "temp = head; head = head->next; delete temp;" },
+    { "doubly linked list", "Each node has next AND prev, so you can walk both ways." },
+    { "deep copy", "A copy constructor builds NEW nodes. The default copy only copies the pointer." },
+};
+static const Flashcard cards10[] = {
+    { "class", "A user-defined type that groups related fields (data) and methods (functions)." },
+    { "field / member", "A variable that belongs to a class, such as x in Point." },
+    { "instance", "One object made from a class. Each instance has its own field values." },
+    { "p.x", "The dot operator reaches a field of an object." },
+    { "pass by value", "A copy of the object is passed. Changes are not kept." },
+    { "pass by reference", "Point &p passes the original object, so changes are kept." },
+    { "method", "A function that belongs to a class. It implicitly gets the current object." },
+    { "this", "Inside a method, a pointer to the object the method was called on." },
+};
+static const Flashcard cards11[] = {
+    { "function overloading", "Several functions with the same name but different parameters." },
+    { "operator overloading", "Giving built-in operators (+, <<, ==) a meaning for your own class." },
+    { "operator+", "The name of the function that overloads +. Box operator+(const Box& b);" },
+    { "this->length", "In a member operator+, the left operand's length." },
+    { "member operator", "A method of the class. The left operand is this, the right one is the parameter." },
+    { "non-member operator", "A normal function that takes both operands as parameters." },
+    { "const Box&", "Pass by reference (no copy) and promise not to modify it." },
+    { "overload by return type?", "Not allowed. Overloads must differ in their parameters." },
+};
+static const Flashcard cards12[] = {
+    { "std::list", "An STL doubly linked list. No random access: use iterators, front() and back()." },
+    { "push_front / push_back", "Add an item at the start or at the end of a list." },
+    { "iterator", "An object that points at an item in a container. *it is the item, ++it moves on." },
+    { "splice", "Moves elements from one list to another without copying them." },
+    { "std::map", "Sorted key/value pairs. Each key appears only once." },
+    { "map[key]", "Inserts when used on the left of =, retrieves when used as a value." },
+    { "find(key)", "Returns an iterator to the pair, or end() if the key is missing." },
+    { "it->first / it->second", "The key and the value of the pair an iterator points at." },
+};
+static const Flashcard cards13[] = {
+    { "template", "A pattern for code that works with any type: template <typename T>." },
+    { "T", "The placeholder type. The compiler replaces it with the real type you use." },
+    { "vector", "A dynamic array that grows and shrinks as needed." },
+    { "push_back / pop_back", "Add or remove an item at the end of a vector." },
+    { "size vs capacity", "Size is how many items are stored. Capacity is how many fit before reallocating." },
+    { "reserve(n)", "Allocates room for n items up front to avoid repeated reallocation." },
+    { "stack", "LIFO: last in, first out. Push and pop at the same end." },
+    { "queue", "FIFO: first in, first out. Push at the rear, pop at the front." },
+};
+static const Flashcard cards14[] = {
+    { "leap year rule", "Divisible by 4, but not by 100 unless also divisible by 400." },
+    { "n % 10", "The last digit of n." },
+    { "n / 10", "n without its last digit (integer division)." },
+    { "reverse a number", "r = r * 10 + n % 10; n /= 10; repeat while n > 0." },
+    { "palindrome", "A number that reads the same backwards. n == Reversed(n)." },
+    { "prime number", "Only divisible by 1 and itself. 0 and 1 are not prime." },
+    { "d * d <= n", "The prime test only needs divisors up to the square root of n." },
+    { "binary to decimal", "Each binary digit is worth a power of 2: 110 = 4 + 2 + 0 = 6." },
+};
+static const Flashcard cards15[] = {
+    { "find", "Return the index of the first match, or -1 when it is not in the array." },
+    { "frequencyCount", "Count how many elements equal the value." },
+    { "countDuplicates", "Check every pair i < j and count the equal ones." },
+    { "2nd largest", "Track the largest and second largest in a single pass." },
+    { "rotateLeft", "Save the first element, shift the rest left, put it at the end." },
+    { "insert at index", "Shift elements right from the back, store the value, count++." },
+    { "delete at index", "Shift later elements left by one, count--." },
+    { "twoMovies", "Two nested loops with j > i. True if any pair sums to the flight length." },
+};
+static const Flashcard cards16[] = {
+    { "right triangle", "Row i prints i letters: an outer loop for rows, an inner loop for columns." },
+    { "wordCounter", "Count each letter that follows a space or the start of the text." },
+    { "cluster", "3 or more identical items in a row (horizontal checked first) or column." },
+    { "ReplaceWithMinusOne", "Score the first cluster (sum of its values) and replace it with -1's." },
+    { "FallDownAndReplace", "Items above a -1 fall down; new items at the top become -2." },
+    { "-2 and 0", "Never part of a cluster." },
+    { "brace depth", "{ adds 1 and } subtracts 1. It tells you which variables are in scope." },
+    { "FindAllVariables", "Collect the names declared as int or char into a comma-separated list." },
+};
+
+static const Flashcard *cardSets[LEVEL_COUNT] = {
+    cards0, cards1, cards2, cards3, cards4, cards5, cards6, cards7, cards8, cards9, cards10, cards11, cards12, cards13, cards14, cards15, cards16
+};
+static const int cardCounts[LEVEL_COUNT] = {
+    NOTE_COUNT(cards0), NOTE_COUNT(cards1), NOTE_COUNT(cards2), NOTE_COUNT(cards3), NOTE_COUNT(cards4), NOTE_COUNT(cards5), NOTE_COUNT(cards6),
+    NOTE_COUNT(cards7), NOTE_COUNT(cards8), NOTE_COUNT(cards9), NOTE_COUNT(cards10), NOTE_COUNT(cards11), NOTE_COUNT(cards12), NOTE_COUNT(cards13),
+    NOTE_COUNT(cards14), NOTE_COUNT(cards15), NOTE_COUNT(cards16)
+};
 
 typedef char bank_fits_in_progress[(QUESTION_BANK_SIZE <= MAX_BANK) ? 1 : -1];
 
@@ -443,9 +1354,7 @@ static Color CandyColor(int i) {
         case 3: return COLOR_ORANGE; case 4: return COLOR_PURPLE; default: return COLOR_PINK;
     }
 }
-static Color LevelColor(int level) {
-    switch (level) { case 0: return COLOR_CYAN; case 1: return COLOR_GREEN; case 2: return COLOR_YELLOW; case 3: return COLOR_ORANGE; default: return COLOR_PURPLE; }
-}
+static Color LevelColor(int level) { return CandyColor(level); }
 static const Question *QuestionAt(int bankIndex) { return &questionBank[bankIndex]; }
 
 // ================================================================ audio
@@ -725,16 +1634,24 @@ static void UpdateAudio(float dt, bool quiet) {
     UpdateMusicStream(musicStream);
 }
 
-static void SetScreen(ScreenState screen) { app.screen = screen; app.screenTime = 0; PlayFx(FX_WHOOSH); }
+static bool mapNeedsCenter;   // the map recentres on the right level the first frame it is shown
+static void SetScreen(ScreenState screen) { app.screen = screen; app.statsOpen = false; app.screenTime = 0; if (screen == SCREEN_MAP) mapNeedsCenter = true; if (screen == SCREEN_REVIEW) app.reviewScroll = 0; PlayFx(FX_WHOOSH); }
 static void ShowToast(const char *text) { snprintf(app.toast, sizeof app.toast, "%s", text); app.toastTime = 2.4f; }
 
 // A click is "used up" by the first widget that takes it, so overlapping widgets never both fire.
+static bool blockAll;   // true while an overlay (the stats panel) owns the mouse: nothing underneath reacts
+static bool statsFresh; // the stats panel was opened this very frame
+static bool chipsDrawn; // a header already drew the HP / stars chips this frame
+static bool escSwallowed;   // ESC was used to close an overlay, so screens must not also react to it
+static bool KeyPressedGuard(int key) { if (key == KEY_ESCAPE && escSwallowed) return false; return (IsKeyPressed)(key); }
+#define IsKeyPressed(k) KeyPressedGuard(k)
 static bool TakeClick(bool hovered) {
+    if (blockAll) return false;
     if (hovered) wantHand = true;
     if (hovered && !clickConsumed && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) { clickConsumed = true; PlayFx(FX_CLICK); return true; }
     return false;
 }
-static bool HoverRect(Rectangle r) { return !uiLocked && CheckCollisionPointRec(GetMousePosition(), r); }
+static bool HoverRect(Rectangle r) { return !uiLocked && !blockAll && CheckCollisionPointRec(GetMousePosition(), r); }
 
 // ================================================================ text
 // Two plain, easy-to-read fonts (system fonts) are used for questions, answers and study notes.
@@ -1118,6 +2035,22 @@ static int TotalStars(void) {
     return total;
 }
 
+// The star count and HP chips. Clicking them opens the stats panel (see DrawStatsPanel).
+static void DrawStatChips(void) {
+        Rectangle hit = { 694, 7, 288, 44 };
+        bool hovered = HoverRect(hit);
+        if (hovered || app.statsOpen) DrawRound(Expand(hit, 2), 22, Fade(COLOR_CYAN, app.statsOpen ? 0.22f : 0.12f));
+        DrawStatChip((Rectangle){ 700, 11, 120, 36 }, true, TotalStars());
+        DrawStatChip((Rectangle){ 835, 11, 140, 36 }, false, app.progress.totalXp);
+        chipsDrawn = true;
+        if (TakeClick(hovered)) { app.statsOpen = !app.statsOpen; statsFresh = true; PlayFx(FX_POP); }
+        if (hovered && !app.statsOpen) {
+            Rectangle tip = { 650, 66, 276, 24 };
+            DrawRoundOutlined(tip, 10, 2, COLOR_CREAM, COLOR_NEON);
+            DrawTextCentered("Click for your HP and stars", (int)(tip.x + tip.width / 2), (int)tip.y + 5, 14, COLOR_TXT);
+        }
+}
+
 // Purple bar with cream icing dripping off the bottom edge.
 // HUD bar with a neon underline and a glitchy chromatic title.
 static void DrawHeaderBar(const char *title, int titleX, bool chips) {
@@ -1130,10 +2063,7 @@ static void DrawHeaderBar(const char *title, int titleX, bool chips) {
         DrawText(title, titleX + 1, 16, 30, Fade(COLOR_PURPLE, 0.6f));
         DrawText(title, titleX, 15, 30, WHITE);
     }
-    if (chips) {
-        DrawStatChip((Rectangle){ 700, 11, 120, 36 }, true, TotalStars());
-        DrawStatChip((Rectangle){ 835, 11, 140, 36 }, false, app.progress.totalXp);
-    }
+    if (chips) DrawStatChips();
 }
 
 // ================================================================ the robot friend, Byte - a real 3D model
@@ -1206,10 +2136,167 @@ static void Ellipsoid(Vector3 c, Vector3 r, Color col, float roll, float glow) {
 
 static Vector3 V3(float x, float y, float z) { return (Vector3){ x, y, z }; }
 
+// ---- accessories and the crown (all built from ellipsoids, drawn in the robot's own coordinates)
+static int WornIn(int slot) {
+    int acc = app.progress.equipped[slot] - 1;
+    return acc >= 0 && acc < ACC_COUNT && (app.progress.owned & (1u << acc)) && accessories[acc].slot == slot ? acc : -1;
+}
+static void Ring3(Vector3 c, float rx, float rz, int count, Vector3 r, Color col, float startDeg, float arcDeg, float glow) {
+    for (int i = 0; i < count; i++) {
+        float a = (startDeg + arcDeg * (count > 1 ? (float)i / (count - 1) : 0)) * DEG2RAD;
+        Ellipsoid(V3(c.x + sinf(a) * rx, c.y, c.z + cosf(a) * rz), r, col, 0, glow);
+    }
+}
+// Gold crown: a band of beads, five spikes and a gem on each tip.
+static void DrawCrown3D(float t) {
+    Color gold = { 255, 214, 92, 255 };
+    Ring3(V3(0, 134, 0), 21, 19, 12, V3(6.5f, 5.5f, 6.5f), gold, 0, 330, 0);
+    for (int i = 0; i < 5; i++) {
+        float a = i * 72.0f * DEG2RAD;
+        float x = sinf(a) * 18, z = cosf(a) * 16;
+        Ellipsoid(V3(x, 144, z), V3(4.4f, 11, 4.4f), gold, 0, 0);
+        Color gem = i % 2 ? (Color){ 120, 255, 238, 255 } : (Color){ 196, 128, 232, 255 };
+        Ellipsoid(V3(x, 156, z), V3(3.6f, 3.6f, 3.6f), gem, 0, 0.7f + 0.3f * sinf(t * 5 + i));
+    }
+}
+static void GearHead(int acc, float t) {
+    switch (acc) {
+        case ACC_CAP: {
+            Color c = { 96, 128, 240, 255 };
+            Ellipsoid(V3(0, 121, 1), V3(40, 24, 37), c, 0, 0);
+            Ellipsoid(V3(0, 125, 33), V3(30, 4, 21), (Color){ 70, 96, 200, 255 }, 0, 0);
+            Ellipsoid(V3(0, 144, 1), V3(4, 3, 4), (Color){ 196, 220, 255, 255 }, 0, 0);
+        } break;
+        case ACC_WIZARD: {
+            Color c = { 112, 84, 206, 255 };
+            Ellipsoid(V3(0, 126, 0), V3(58, 4, 54), (Color){ 86, 64, 170, 255 }, 0, 0);
+            Ellipsoid(V3(0, 140, 0), V3(31, 15, 29), c, 0, 0);
+            Ellipsoid(V3(2, 157, 0), V3(22, 14, 21), c, 0, 0);
+            Ellipsoid(V3(6, 173, 0), V3(14, 13, 13), c, -8, 0);
+            Ellipsoid(V3(11, 187, 0), V3(7, 11, 7), c, -14, 0);
+            Ellipsoid(V3(0, 142, 28), V3(5, 5, 3), (Color){ 255, 214, 92, 255 }, 0, 0.5f);
+            Ellipsoid(V3(6, 162, 19), V3(3.5f, 3.5f, 2.5f), (Color){ 255, 214, 92, 255 }, 0, 0.5f);
+        } break;
+        case ACC_PHONES: {
+            for (int i = 0; i < 9; i++) {
+                float a = (i * 180.0f / 8.0f) * DEG2RAD;
+                Ellipsoid(V3(cosf(a) * 48, 104 + sinf(a) * 40, 0), V3(4.5f, 4.5f, 6), (Color){ 70, 80, 140, 255 }, 0, 0);
+            }
+            for (int side = -1; side <= 1; side += 2) {
+                Ellipsoid(V3(side * 53.0f, 104, 0), V3(9, 18, 18), (Color){ 62, 206, 210, 255 }, 0, 0.1f);
+                Ellipsoid(V3(side * 58.0f, 104, 0), V3(3, 11, 11), (Color){ 20, 40, 70, 255 }, 0, 0);
+            }
+        } break;
+        case ACC_TOPHAT: {
+            Color c = { 34, 36, 66, 255 };
+            Ellipsoid(V3(0, 131, 0), V3(50, 4, 47), c, 0, 0);
+            for (int k = 0; k < 3; k++) Ellipsoid(V3(0, 141 + k * 11.0f, 0), V3(28, 9, 27), c, 0, 0);
+            Ellipsoid(V3(0, 173, 0), V3(28, 3.5f, 27), c, 0, 0);
+            Ellipsoid(V3(0, 142, 0), V3(29.5f, 4, 28.5f), (Color){ 62, 206, 210, 255 }, 0, 0.1f);
+        } break;
+        case ACC_PROP: {
+            Ellipsoid(V3(0, 121, 1), V3(40, 24, 37), (Color){ 196, 128, 232, 255 }, 0, 0);
+            for (int i = 0; i < 6; i++) {   // beanie panels
+                float a = i * 60.0f * DEG2RAD;
+                Ellipsoid(V3(sinf(a) * 24, 134, cosf(a) * 22), V3(7, 5, 7), i % 2 ? (Color){ 110, 142, 255, 255 } : (Color){ 62, 206, 210, 255 }, 0, 0);
+            }
+            Ellipsoid(V3(0, 147, 0), V3(2.5f, 8, 2.5f), (Color){ 220, 228, 250, 255 }, 0, 0);
+            float spin = t * 14.0f;
+            for (int blade = 0; blade < 2; blade++)
+                for (int k = -3; k <= 3; k++) {
+                    float a = spin * DEG2RAD + blade * PI, d = k * 4.6f;
+                    Ellipsoid(V3(cosf(a) * d, 155, sinf(a) * d), V3(4.6f, 1.6f, 4.6f), blade ? (Color){ 62, 206, 210, 255 } : (Color){ 110, 142, 255, 255 }, 0, 0.1f);
+                }
+            Ellipsoid(V3(0, 156, 0), V3(3.5f, 3.5f, 3.5f), (Color){ 255, 214, 92, 255 }, 0, 0.3f);
+        } break;
+    }
+}
+static void GearFace(int acc, float t) {
+    (void)t;
+    switch (acc) {
+        case ACC_SHADES: {
+            Color lens = { 14, 16, 34, 255 };
+            for (int side = -1; side <= 1; side += 2) {
+                Ellipsoid(V3(side * 15.0f, 110, 42), V3(14, 10, 3.5f), lens, 0, 0);
+                Ellipsoid(V3(side * 35.0f, 110, 28), V3(2.2f, 2.2f, 14), lens, 0, 0);
+                Ellipsoid(V3(side * 10.0f, 114, 46), V3(5, 1.6f, 1), (Color){ 120, 255, 238, 255 }, 0, 0.7f);
+            }
+            Ellipsoid(V3(0, 111, 43), V3(5, 1.8f, 2.5f), lens, 0, 0);
+        } break;
+        case ACC_NERD: {
+            Color frame = { 150, 112, 232, 255 };
+            for (int side = -1; side <= 1; side += 2) {
+                for (int i = 0; i < 14; i++) {
+                    float a = i * 360.0f / 14.0f * DEG2RAD;
+                    Ellipsoid(V3(side * 15.0f + cosf(a) * 12.5f, 110 + sinf(a) * 11.5f, 43), V3(2.2f, 2.2f, 2.2f), frame, 0, 0);
+                }
+                Ellipsoid(V3(side * 36.0f, 110, 28), V3(1.8f, 1.8f, 14), frame, 0, 0);
+            }
+            Ellipsoid(V3(0, 111, 43), V3(4, 1.8f, 2), frame, 0, 0);
+        } break;
+        case ACC_VISOR: {
+            Ellipsoid(V3(0, 110, 40), V3(37, 11, 7), (Color){ 62, 206, 210, 170 }, 0, 0.45f);
+            Ellipsoid(V3(0, 114, 46), V3(30, 1.8f, 1.5f), (Color){ 220, 255, 252, 255 }, 0, 0.8f);
+            for (int side = -1; side <= 1; side += 2) Ellipsoid(V3(side * 38.0f, 110, 26), V3(3, 9, 12), (Color){ 62, 206, 210, 255 }, 0, 0.2f);
+        } break;
+    }
+}
+static void GearNeck(int acc, float t) {
+    (void)t;
+    switch (acc) {
+        case ACC_BOWTIE: {
+            Color c = { 196, 128, 232, 255 };
+            for (int side = -1; side <= 1; side += 2) Ellipsoid(V3(side * 9.0f, 70, 20), V3(8, 5.5f, 4), c, side * 18.0f, 0);
+            Ellipsoid(V3(0, 70, 22), V3(3.8f, 3.8f, 3.8f), (Color){ 140, 90, 200, 255 }, 0, 0);
+        } break;
+        case ACC_SCARF: {
+            for (int i = 0; i < 13; i++) {
+                float a = (i * 360.0f / 13.0f) * DEG2RAD;
+                Ellipsoid(V3(sinf(a) * 17, 71, cosf(a) * 15), V3(7, 5.5f, 7), i % 2 ? (Color){ 62, 206, 210, 255 } : (Color){ 110, 142, 255, 255 }, 0, 0);
+            }
+            Ellipsoid(V3(10, 58, 19), V3(5, 15, 3.5f), (Color){ 62, 206, 210, 255 }, 8, 0);
+            Ellipsoid(V3(10, 46, 20), V3(5, 3, 3.5f), (Color){ 110, 142, 255, 255 }, 8, 0);
+        } break;
+        case ACC_MEDAL: {
+            Color gold = { 255, 214, 92, 255 };
+            Ellipsoid(V3(-7, 68, 17), V3(2.5f, 10, 1.6f), (Color){ 110, 142, 255, 255 }, -18, 0);
+            Ellipsoid(V3(-14, 62, 22), V3(8, 8, 2.5f), gold, 0, 0);
+            Ellipsoid(V3(-14, 62, 24), V3(4, 4, 1.5f), (Color){ 230, 170, 40, 255 }, 0, 0);
+        } break;
+    }
+}
+static void GearBack(int acc, float t) {
+    switch (acc) {
+        case ACC_CAPE: {
+            float sw = sinf(t * 2.0f) * 3.0f;
+            Ellipsoid(V3(0, 48, -23 - sw), V3(27, 32, 4), (Color){ 124, 76, 206, 255 }, 0, 0);
+            Ellipsoid(V3(0, 22, -23 - sw * 1.6f), V3(25, 7, 3.5f), (Color){ 98, 58, 176, 255 }, 0, 0);
+            for (int side = -1; side <= 1; side += 2) Ellipsoid(V3(side * 17.0f, 74, -11), V3(4.5f, 4.5f, 4.5f), (Color){ 255, 214, 92, 255 }, 0, 0);
+        } break;
+        case ACC_JETPACK: {
+            float flick = sinf(t * 30.0f) * 3.0f;
+            for (int side = -1; side <= 1; side += 2) {
+                Ellipsoid(V3(side * 13.0f, 54, -27), V3(8.5f, 19, 8.5f), (Color){ 176, 188, 218, 255 }, 0, 0);
+                Ellipsoid(V3(side * 13.0f, 70, -27), V3(7, 3, 7), (Color){ 110, 142, 255, 255 }, 0, 0);
+                Ellipsoid(V3(side * 13.0f, 34, -27), V3(6, 4, 6), (Color){ 40, 48, 90, 255 }, 0, 0);
+                Ellipsoid(V3(side * 13.0f, 22 - flick, -27), V3(5, 11 + flick, 5), (Color){ 120, 220, 255, 220 }, 0, 1);
+            }
+            Ellipsoid(V3(0, 56, -26), V3(10, 4, 4), (Color){ 140, 150, 190, 255 }, 0, 0);
+        } break;
+        case ACC_WINGS: {
+            float flap = sinf(t * 3.0f) * 7.0f;
+            for (int side = -1; side <= 1; side += 2)
+                for (int k = 0; k < 4; k++)
+                    Ellipsoid(V3(side * (34.0f + k * 11.0f), 78 - k * 7.0f + flap * (k + 1) * 0.25f, -24 - k * 2.0f), V3(17, 5, 3), (Color){ 236, 242, 255, 255 }, side * (-30.0f + k * 14.0f - flap), 0.04f * k);
+        } break;
+    }
+}
+
 // cx = horizontal centre, footY = ground line on screen, s = size (1.0 is about 165 px tall).
 static void DrawBot(float cx, float footY, float s, BotMood mood) {
     float t = (float)GetTime();
     Vector2 mouse = GetMousePosition();
+    if (app.botSad > 1.2f && (mood == MOOD_HAPPY || mood == MOOD_THINK)) mood = MOOD_SAD;   // lost the crown: sad for a moment, then smiles again
     float up = sinf(t * 3.0f) * 2.5f;
     if (mood == MOOD_CHEER) up = fabsf(sinf(t * 7.0f)) * 12.0f;
     if (mood == MOOD_SAD) up = sinf(t * 1.6f) * 1.0f;
@@ -1252,6 +2339,10 @@ static void DrawBot(float cx, float footY, float s, BotMood mood) {
     float beat = 1.0f + 0.16f * sinf(t * 6.0f);
     Color core = mood == MOOD_SAD ? (Color){ 130, 150, 255, 255 } : (Color){ 150, 120, 255, 255 };
     Ellipsoid(V3(0, 55, 21), V3(6 * beat, 6 * beat, 4), core, 0, 0.75f + 0.25f * sinf(t * 6.0f));
+
+    int wornBack = WornIn(SLOT_BACK), wornNeck = WornIn(SLOT_NECK), wornFace = WornIn(SLOT_FACE), wornHead = WornIn(SLOT_HEAD);
+    if (wornBack >= 0) GearBack(wornBack, t);
+    if (wornNeck >= 0) GearNeck(wornNeck, t);
 
     // arms: 0 = hanging down, 90 = straight out, 180 = straight up
     float angL = 22, angR = 22;
@@ -1298,14 +2389,34 @@ static void DrawBot(float cx, float footY, float s, BotMood mood) {
     else if (mood == MOOD_CHEER) Ellipsoid(V3(0, 91, 40), V3(7, 4.5f, 2.5f), (Color){ 180, 130, 255, 255 }, 0, 0.85f);
     else for (int k = -3; k <= 3; k++) Ellipsoid(V3(k * 2.6f, 90 + k * k * 0.5f, 40), V3(1.8f, 1.8f, 1.5f), glow, 0, 1);
 
-    // antenna
+    if (wornFace >= 0) GearFace(wornFace, t);
+
+    // antenna (hidden under a hat or the crown)
     float sway = sinf(t * 2.0f) * 3.0f;
     if (mood == MOOD_SAD) sway = 7;
-    Ellipsoid(V3(sway * 0.5f, 142, 0), V3(2.2f, 10, 2.2f), shadeCol, -sway * 1.4f, 0);
-    Color bulb = mood == MOOD_SAD ? (Color){ 150, 170, 235, 255 } : (Color){ 160, 220, 255, 255 };
-    Ellipsoid(V3(sway, 153, 0), V3(7, 7, 7), bulb, 0, 0.55f + 0.45f * sinf(t * 4.0f));
+    if (app.progress.crown) DrawCrown3D(t);
+    else if (wornHead >= 0) GearHead(wornHead, t);
+    else {
+        Ellipsoid(V3(sway * 0.5f, 142, 0), V3(2.2f, 10, 2.2f), shadeCol, -sway * 1.4f, 0);
+        Color bulb = mood == MOOD_SAD ? (Color){ 150, 170, 235, 255 } : (Color){ 160, 220, 255, 255 };
+        Ellipsoid(V3(sway, 153, 0), V3(7, 7, 7), bulb, 0, 0.55f + 0.45f * sinf(t * 4.0f));
+    }
     g3Tilt = sTilt; g3Yaw = sYaw; g3Roll = sRoll;
     rlPopMatrix();
+
+    if (app.crownFall > 0) {   // the lost crown tumbles off Byte's head
+        float f = 1.6f - app.crownFall;
+        if (f < 0) f = 0;
+        rlPushMatrix();
+        rlTranslatef(f * 46.0f, 145.0f - f * f * 120.0f + f * 40.0f, 30);
+        rlRotatef(f * 280.0f, 0, 0, 1);
+        rlTranslatef(0, -145.0f, 0);
+        float sg = g3Roll, sy = g3Yaw, st = g3Tilt;
+        g3Roll += f * 280.0f;
+        DrawCrown3D(t);
+        g3Roll = sg; g3Yaw = sy; g3Tilt = st;
+        rlPopMatrix();
+    }
 
     rlPopMatrix();
     rlEnableBackfaceCulling();
@@ -1371,7 +2482,7 @@ static void DrawEffects(void) {
     }
     for (int i = 0; i < MAX_FLOATS; i++)
         if (floatTexts[i].life > 0) DrawTextCO(floatTexts[i].text, (int)floatTexts[i].pos.x, (int)floatTexts[i].pos.y, 30, Fade(floatTexts[i].color, Clampf(floatTexts[i].life / 0.4f, 0, 1)), Fade(COLOR_INK, Clampf(floatTexts[i].life / 0.4f, 0, 1)));
-    if (app.toastTime > 0) {
+    if (app.toastTime > 0 && app.screen != SCREEN_RESULTS) {
         int w = MeasureText(app.toast, 22) + 50;
         Rectangle r = { (WINDOW_WIDTH - w) / 2.0f, 520, (float)w, 46 };
         float a = Clampf(app.toastTime / 0.4f, 0, 1);
@@ -1382,6 +2493,7 @@ static void DrawEffects(void) {
 
 // ================================================================ candy button
 // Glossy button with a chunky 3D base. Returns true when clicked.
+static bool buttonPlain;   // true = button labels use the plain reading font (easier to read)
 static Color Mix(Color c, float f) { return (Color){ (unsigned char)(c.r * f), (unsigned char)(c.g * f), (unsigned char)(c.b * f), 255 }; }
 
 // Arcade-style neon button: dark glass face, glowing edge, chunky base. Returns true when clicked.
@@ -1400,7 +2512,18 @@ static bool DrawCandyButton(Rectangle bounds, const char *label, Color fill, boo
     DrawChamfer(top, cut, neon);
     DrawChamfer(Expand(top, -3), cut - 1.5f, enabled ? Mix(neon, hovered ? 0.5f : 0.17f) : (Color){22, 22, 44, 255});
     DrawRectangle((int)(top.x + cut + 4), (int)top.y + 5, (int)(top.width - 2 * cut - 8), 2, Fade(WHITE, enabled ? 0.28f : 0.1f));
-    if (label[0]) {
+    if (label[0] && buttonPlain && readFontOk) {
+        int saved = textMode;
+        textMode = 1;
+        int size = fontSize + 2;
+        while (size > 12 && TextW(label, size) > (int)top.width - 2 * (int)cut) size--;
+        int tw = TextW(label, size), tx = (int)(top.x + top.width / 2) - tw / 2, ty = (int)(top.y + top.height / 2) - size / 2 - 1;
+        Color text = enabled ? (hovered ? WHITE : ColorBrightness(neon, 0.6f)) : (Color){130, 136, 170, 255};
+        TextDraw(label, tx + 1, ty + 2, size, Fade(COLOR_INK, 0.8f));
+        TextDraw(label, tx, ty, size, text);
+        TextDraw(label, tx + 1, ty, size, text);   // second pass = slightly bolder
+        textMode = saved;
+    } else if (label[0]) {
         int tw = MeasureText(label, fontSize);
         Color text = enabled ? (hovered ? WHITE : ColorBrightness(neon, 0.35f)) : (Color){110, 116, 150, 255};
         DrawTextO(label, (int)(top.x + top.width / 2) - tw / 2, (int)(top.y + top.height / 2) - fontSize / 2 + 1, fontSize, text, COLOR_INK);
@@ -1438,6 +2561,29 @@ static void SaveProfiles(void) {
     free(buffer);
 }
 
+// Turns whatever size of progress record was saved into the current layout.
+static void ConvertProgress(const unsigned char *data, int size, Progress *out) {
+    memset(out, 0, sizeof *out);
+    if (size == (int)sizeof(Progress)) { memcpy(out, data, sizeof *out); return; }
+    LegacyProgress old;
+    memset(&old, 0, sizeof old);
+    memcpy(&old, data, (size_t)(size < (int)sizeof old ? size : (int)sizeof old));
+    for (int m = 0; m < MODE_COUNT; m++) for (int l = 0; l < 5; l++) out->bestGems[m][l] = old.bestGems[m][l];
+    out->totalXp = old.totalXp;
+    for (int i = 0; i < 64 && i < MAX_BANK; i++) out->stats[i] = old.stats[i];
+    memcpy(out->boost, old.boost, sizeof out->boost);
+    out->milestone = old.milestone;
+}
+
+// Makes sure rewards earned before accessories existed are in the wardrobe.
+static void FixProgress(Progress *p) {
+    if (p->milestone < 0) p->milestone = 0;
+    if (p->milestone > MILESTONE_COUNT) p->milestone = MILESTONE_COUNT;
+    for (int i = 0; i < p->milestone && i < ACC_COUNT; i++) p->owned |= 1u << i;
+    for (int s = 0; s < SLOT_COUNT; s++) if (p->equipped[s] < 0 || p->equipped[s] > ACC_COUNT) p->equipped[s] = 0;
+    p->crown = p->crown ? 1 : 0;
+}
+
 static void LoadProfiles(void) {
     profileCount = 0;
     if (!FileExists(PROFILE_FILE)) return;
@@ -1454,7 +2600,8 @@ static void LoadProfiles(void) {
             for (int i = 0; i < count; i++) {
                 memcpy(profiles[i].name, data + 12 + i * record, NAME_CAP);
                 profiles[i].name[NAME_CAP - 1] = '\0';
-                memcpy(&profiles[i].progress, data + 12 + i * record + NAME_CAP, (size_t)(progressSize < (int)sizeof(Progress) ? progressSize : (int)sizeof(Progress)));
+                ConvertProgress(data + 12 + i * record + NAME_CAP, progressSize, &profiles[i].progress);
+                FixProgress(&profiles[i].progress);
             }
             profileCount = count;
         }
@@ -1508,8 +2655,9 @@ static void LoadGuestProgress(void) {
     int size = 0;
     unsigned char *data = LoadFileData(PROGRESS_FILE, &size);
     // Older save files are shorter (no per-question stats / boosters yet) and still load fine.
-    if (data && size > 0 && size <= (int)sizeof(Progress)) memcpy(&app.progress, data, (size_t)size);
+    if (data && size > 0 && size <= (int)sizeof(Progress)) ConvertProgress(data, size, &app.progress);
     if (data) UnloadFileData(data);
+    FixProgress(&app.progress);
 }
 
 static bool HasProgress(void) {
@@ -1527,6 +2675,7 @@ static void SaveProgress(void) {
 static void SelectProfile(int index) {
     activeProfile = index;
     app.progress = profiles[index].progress;
+    FixProgress(&app.progress);
 }
 
 // Saves whatever the guest has achieved under a name and switches to that player (the guest slot is cleared).
@@ -1539,7 +2688,7 @@ static int CreateProfile(const char *name, bool keepCurrentProgress) {
     return index;
 }
 
-static bool IsLevelAvailable(QuizMode mode, int level) { return !(mode == MODE_MCQ && level == LEVEL_COUNT - 1); }
+static bool IsLevelAvailable(QuizMode mode, int level) { (void)mode; (void)level; return true; }   // every level exists in both modes
 
 static bool IsLevelUnlocked(QuizMode mode, int level) {
     return IsLevelAvailable(mode, level) && (level == 0 || app.progress.bestGems[mode][level - 1] >= 1);
@@ -1597,17 +2746,36 @@ static void LoadQuestionInputs(void) {
     app.runCountdown = 0;
 }
 
-// ---- HP milestones hand out boosters
+// ---- the crown: earned by a flawless level, lost on the next mistake or failed run
+static void LoseCrown(void) {
+    if (!app.progress.crown) return;
+    app.progress.crown = 0;
+    app.crownFall = 1.6f;
+    app.botSad = 3.6f;
+    app.crownLostNow = true;
+    ShowToast("Crown lost! Byte is sad... he'll smile again soon");
+    PlayFx(FX_FAIL);
+    SaveProgress();
+}
+
+// ---- HP milestones hand out boosters AND a new wardrobe accessory
 static void CheckMilestones(void) {
     while (app.progress.milestone < MILESTONE_COUNT && app.progress.totalXp >= milestoneHp[app.progress.milestone]) {
         int m = app.progress.milestone++;
-        char text[96] = "NEW BOOSTER: ";
+        char text[96] = "NEW REWARD: ";
         for (int b = 0; b < BOOST_COUNT; b++) {
             if (milestoneReward[m][b] <= 0) continue;
             app.progress.boost[b] += milestoneReward[m][b];
             char part[32];
             snprintf(part, sizeof part, "%s x%d  ", boostShort[b], milestoneReward[m][b]);
             strncat(text, part, sizeof text - strlen(text) - 1);
+        }
+        if (m < ACC_COUNT) {
+            app.progress.owned |= 1u << m;
+            int slot = accessories[m].slot;
+            if (app.progress.equipped[slot] == 0) app.progress.equipped[slot] = m + 1;   // wear it straight away if the slot is free
+            strncat(text, "+ ", sizeof text - strlen(text) - 1);
+            strncat(text, accessories[m].name, sizeof text - strlen(text) - 1);
         }
         snprintf(app.rewardText, sizeof app.rewardText, "%s", text);
         ShowToast(text);
@@ -1657,6 +2825,8 @@ static void BeginSession(void) {
     for (int i = 0; i < MAX_QUESTIONS_PER_LEVEL; i++) app.used5050[i] = false;
     app.bonusHp = 0;
     app.rewardText[0] = '\0';
+    app.crownEarnedNow = app.crownLostNow = false;
+    if (app.progress.crown) ShowToast("Crown on! Make no mistakes to keep it");
     app.introTime = 2.1f;
     app.qTime = 0;
     LoadQuestionInputs();
@@ -1705,6 +2875,12 @@ static void FinishSession(void) {
     for (int i = 0; i < app.questionCount; i++) if (app.qStatus[i] == ST_CORRECT) app.correctCount++;
     app.levelGems = GemsForScore(app.correctCount, app.questionCount);
     app.bonusHp = 0;
+    bool flawless = app.levelIndex >= 0 && app.questionCount > 0 && app.correctCount == app.questionCount && app.fixedCount == 0;
+    if (flawless) {
+        if (app.progress.crown) app.bonusHp += 10;   // kept the crown: streak bonus
+        else { app.progress.crown = 1; app.crownEarnedNow = true; PlayFx(FX_UNLOCK); }
+        app.progress.crownsEarned++;
+    } else if (app.progress.crown) LoseCrown();
     if (app.levelIndex >= 0) {   // clearing a level for the first time (and 3-starring it) lifts your HP
         int old = app.progress.bestGems[app.mode][app.levelIndex];
         if (old == 0 && app.levelGems > 0) app.bonusHp += 25;
@@ -1769,6 +2945,7 @@ static void SubmitAnswer(const Question *question, bool correct, const char *det
         } else {
             *status = ST_WRONG;
             app.streak = 0;
+            LoseCrown();
         }
         snprintf(app.feedbackHead, sizeof app.feedbackHead, "%s", correct ? cheers[GetRandomValue(0, 3)] : "Not quite...");
     } else if (*status == ST_WRONG && correct) {
@@ -1884,6 +3061,19 @@ static void HandleCodeInput(void) {
 // Writes the learner's function plus the test harness, compiles it with gcc and runs it.
 // Writes the learner's function plus the test harness, compiles it with gcc and runs it.
 static bool RunCodeChallenge(const Question *question, char *detail, int detailSize) {
+    {   // an untouched starter must not pass by luck (an empty function returns leftover garbage)
+        char mine[1100], starter[1100];
+        char noComments[1100]; int nc = 0;
+        for (const char *p = app.codeAnswer; *p && nc < 1090; p++) {
+            if (p[0] == '/' && p[1] == '/') { while (*p && *p != '\n') p++; if (!*p) break; }
+            else if (p[0] == '/' && p[1] == '*') { p += 2; while (*p && !(p[0] == '*' && p[1] == '/')) p++; if (!*p) break; p++; }
+            else noComments[nc++] = *p;
+        }
+        noComments[nc] = 0;
+        NormalizeText(noComments, mine, sizeof mine);
+        NormalizeText(question->starterCode, starter, sizeof starter);
+        if (strcmp(mine, starter) == 0) { snprintf(detail, detailSize, "Write some code inside the function first, then run the tests."); return false; }
+    }
     static char sourceText[4096];
     snprintf(sourceText, sizeof sourceText, "#include <stdio.h>\n#include <stdbool.h>\n%s\n%s\n", app.codeAnswer, question->testHarness);
     SaveFileText("cquest_attempt.c", sourceText);
@@ -1907,6 +3097,9 @@ static bool RunCodeChallenge(const Question *question, char *detail, int detailS
 // ================================================================ screens
 static bool titleSeen;
 static float titleBootShift, titleLeave = -1.0f;
+static bool playFlow;       // true from the moment PLAY is clicked until "Choose your path" appears
+static bool playerPicked;   // a player (or guest) was chosen this session
+static ScreenState notesReturn = SCREEN_TITLE;   // where the notes screen goes back to
 
 static void ScreenTitle(void) {
     float t = (float)GetTime(), dt = GetFrameTime();
@@ -1953,7 +3146,12 @@ static void ScreenTitle(void) {
     float a = e - 1.9f;   // seconds since the title revealed itself
     if (titleLeave >= 0) {
         titleLeave += dt;
-        if (titleLeave > 0.95f) { titleLeave = -1.0f; titleSeen = true; SetScreen(profileCount > 0 ? SCREEN_PROFILES : SCREEN_HUB); return; }
+        if (titleLeave > 0.95f) {
+            titleLeave = -1.0f; titleSeen = true;
+            // "Choose your path" is ONLY reachable through the PLAY button (after picking a player the first time).
+            SetScreen(profileCount > 0 && !playerPicked ? SCREEN_PROFILES : SCREEN_HUB);
+            return;
+        }
     }
     DrawBackground(0);
     DrawCloud(V2(170 + sinf(t * 0.3f) * 20, 150), 1.0f, Fade(WHITE, 0.6f));
@@ -2005,11 +3203,18 @@ static void ScreenTitle(void) {
     if (popIn > 0.02f) {
         Rectangle play = { 500 - 140 * pulse, 568 + (1 - popIn) * 40, 280 * pulse, 62 };
         bool clicked = DrawCandyButton(play, "PLAY", COLOR_GREEN, ready, 38);
-        if (ready && (clicked || skip)) {
+        if (ready && clicked) {   // only a click on the PLAY button starts the game (not ENTER, SPACE or a click elsewhere)
+            playFlow = true;
             titleLeave = 0.0001f;
             SpawnBurst(V2(500, 400), 46);
             PlayFx(FX_UNLOCK);
         }
+    }
+    if (ready) {   // small side buttons: switch player / dress Byte up
+        buttonPlain = true;
+        if (DrawCandyButton((Rectangle){ 28, 574, 190, 50 }, "PLAYERS", COLOR_PURPLE, true, 20)) { playFlow = false; SetScreen(SCREEN_PROFILES); }
+        if (DrawCandyButton((Rectangle){ 782, 574, 190, 50 }, "WARDROBE", COLOR_CYAN, true, 20)) SetScreen(SCREEN_WARDROBE);
+        buttonPlain = false;
     }
     if (a < 0.2f) DrawRectangle(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT, Fade(COLOR_TXT, 0.5f * (1.0f - a / 0.2f)));   // soft flash after boot
 }
@@ -2074,6 +3279,28 @@ static Color AvatarColor(const char *name) {
 
 static void OpenNameModal(int mode) { app.nameModal = mode; app.nameBuf[0] = '\0'; app.nameLen = 0; }
 
+// SAVE button used on the maps and during questions. Named players save straight away; a guest picks a name first.
+static void SaveNow(void) {
+    if (activeProfile >= 0) {
+        SaveProgress();
+        char msg[64];
+        snprintf(msg, sizeof msg, "Progress saved for %.20s!", PlayerName());
+        ShowToast(msg);
+        PlayFx(FX_UNLOCK);
+        SpawnBurst(V2(500, 300), 24);
+    } else OpenNameModal(2);
+}
+static bool DrawSaveButton(Rectangle r) {
+    bool clicked = DrawCandyButton(r, "SAVE", COLOR_GREEN, !app.nameModal, 18);
+    if (activeProfile < 0 && HasProgress()) {   // a guest with something to lose gets a gentle pulse
+        float pulse = 0.5f + 0.5f * sinf((float)GetTime() * 4);
+        DrawRectangleLinesEx(Expand(r, 3), 2, Fade(COLOR_GREEN, 0.25f + 0.4f * pulse));
+    }
+    return clicked;
+}
+// After picking or creating a player: inside the PLAY flow carry on to "Choose your path", otherwise go back to the title.
+static void LeaveProfileScreen(void) { playerPicked = true; SetScreen(playFlow ? SCREEN_HUB : SCREEN_TITLE); }
+
 // Pop-up that asks for a player name (new player, or "save my guest progress as ...").
 static void DrawNameModal(void) {
     if (!app.nameModal) return;
@@ -2107,7 +3334,7 @@ static void DrawNameModal(void) {
         int mode = app.nameModal;
         app.nameModal = 0;
         CreateProfile(start, mode == 2);
-        if (mode == 1) SetScreen(SCREEN_HUB);
+        if (mode == 1) LeaveProfileScreen();
         else { char msg[64]; snprintf(msg, sizeof msg, "Saved! Welcome, %s", start); ShowToast(msg); }
         PlayFx(FX_UNLOCK);
         SpawnBurst(V2(500, 300), 40);
@@ -2193,7 +3420,7 @@ static void ScreenProfiles(void) {
         float barH = view.height * view.height / total;
         DrawRound((Rectangle){ view.x + view.width - 6, view.y + (view.height - barH) * (app.profileScroll / maxScroll), 5, barH }, 2, COLOR_CYAN);
     }
-    if (chosen >= 0) { SelectProfile(chosen); SetScreen(SCREEN_HUB); PlayFx(FX_UNLOCK); }
+    if (chosen >= 0) { SelectProfile(chosen); LeaveProfileScreen(); PlayFx(FX_UNLOCK); }
     if (deleted >= 0) app.confirmDelete = deleted + 1;
 
     // right column: robot and the two big buttons
@@ -2202,7 +3429,7 @@ static void ScreenProfiles(void) {
     if (DrawCandyButton((Rectangle){ 690, 440, 280, 58 }, "+ NEW PLAYER", COLOR_GREEN, true, 26)) OpenNameModal(1);
     if (DrawCandyButton((Rectangle){ 690, 506, 280, 50 }, "PLAY AS GUEST", COLOR_PURPLE, true, 22)) {
         LoadGuestProgress();
-        SetScreen(SCREEN_HUB);
+        LeaveProfileScreen();
     }
     DrawNameModal();
     DrawDeleteConfirm();
@@ -2244,22 +3471,22 @@ static void DrawHubCard(Rectangle r, int kind, Color accent) {
         DrawText((int)(GetTime() * 2) % 2 == 0 ? "int x = 5;_" : "int x = 5;", (int)box.x + 16, (int)box.y + 38, 20, COLOR_CODE_TXT);
     }
     const char *descriptions[3] = {
-        "Study each module: clear notes plus flashcards with the key terms.",
+        "Study every module: clear notes plus flashcards with the key terms.",
         "Pick the right answer from four choices. Travel the Neon Skyline.",
-        "Type your answers, then compile real code in the Function Lab.",
+        "Type your answers and compile real code with gcc in Circuit City.",
     };
     WrapText(descriptions[kind], (int)r.x + 22, (int)r.y + 188, (int)r.width - 44, 17, COLOR_TXT, true);
     char text[40];
-    if (kind == 0) snprintf(text, sizeof text, "%d modules", LEVEL_COUNT);
+    if (kind == 0) snprintf(text, sizeof text, "%d modules", LEVEL_COUNT);   // notes cover every module
     else {
         int stars = 0, maxStars = 0;
-        for (int l = 0; l < LEVEL_COUNT; l++) if (IsLevelAvailable((QuizMode)(kind - 1), l)) { stars += app.progress.bestGems[kind - 1][l]; maxStars += 3; }
+        for (int l = 0; l < LEVEL_COUNT; l++) { stars += app.progress.bestGems[kind - 1][l]; maxStars += 3; }
         snprintf(text, sizeof text, "%d / %d", stars, maxStars);
         DrawStarShape(V2(r.x + 34, r.y + r.height - 38), 12, 0, COLOR_YELLOW);
     }
     DrawText(text, (int)r.x + (kind == 0 ? 24 : 54), (int)r.y + (int)r.height - 48, 20, COLOR_TXT);
     if (DrawCandyButton((Rectangle){ r.x + r.width - 150, r.y + r.height - 66, 130, 50 }, kind == 0 ? "OPEN" : "PLAY", accent, true, 24) || TakeClick(hovered)) {
-        if (kind == 0) { app.notesLevel = -1; app.notesTab = 0; SetScreen(SCREEN_NOTES); }
+        if (kind == 0) { app.notesLevel = -1; app.notesTab = 0; notesReturn = SCREEN_TITLE; SetScreen(SCREEN_NOTES); }
         else { app.mode = (QuizMode)(kind - 1); SetScreen(SCREEN_MAP); }
     }
 }
@@ -2316,7 +3543,7 @@ static void ScreenHub(void) {
 
     DrawHeaderBar("CHOOSE YOUR PATH", 122, true);
     if (DrawCandyButton((Rectangle){ 12, 8, 100, 44 }, "BACK", COLOR_ORANGE, true, 20) || (!app.nameModal && IsKeyPressed(KEY_ESCAPE))) SetScreen(SCREEN_TITLE);
-    if (DrawCandyButton((Rectangle){ 25, 572, 190, 54 }, "PLAYERS", COLOR_PURPLE, true, 22)) SetScreen(SCREEN_PROFILES);
+    if (DrawCandyButton((Rectangle){ 25, 572, 190, 54 }, "WARDROBE", COLOR_PURPLE, true, 22)) SetScreen(SCREEN_WARDROBE);
     if (activeProfile < 0 && HasProgress()) {
         float pulse = 0.5f + 0.5f * sinf((float)GetTime() * 4);
         DrawRound((Rectangle){ 225, 568, 200, 62 }, 18, Fade(COLOR_GREEN, 0.10f + 0.12f * pulse));
@@ -2400,38 +3627,65 @@ static void DrawFlashcard(Rectangle r, int level, int index, float flip, float p
 
 static void ScreenNotes(void) {
     DrawBackground(0.42f);
+    buttonPlain = true;   // plain, easy-to-read button text on this screen
     float e = app.screenTime;
-    if (app.notesLevel < 0) {   // ---- module list
-        DrawHeaderBar("STUDY NOTES", 122, true);
-        if (DrawCandyButton((Rectangle){ 12, 8, 100, 44 }, "BACK", COLOR_ORANGE, true, 20) || IsKeyPressed(KEY_ESCAPE)) { SetScreen(SCREEN_HUB); return; }
+    if (app.notesLevel < 0) {   // ---- module list (scrolls)
+        static float listScroll;
+        if (e < 0.05f) listScroll = 0;
+        Rectangle view = { 0, 70, WINDOW_WIDTH, WINDOW_HEIGHT - 70 };
+        const float rowH = 92;
+        float total = LEVEL_COUNT * rowH + 20, maxScroll = total - view.height > 0 ? total - view.height : 0;
+        if (!blockAll) listScroll -= GetMouseWheelMove() * 70;
+        if (KeyRepeat(KEY_DOWN)) listScroll += 50;
+        if (KeyRepeat(KEY_UP)) listScroll -= 50;
+        if (KeyRepeat(KEY_PAGE_DOWN)) listScroll += 400;
+        if (KeyRepeat(KEY_PAGE_UP)) listScroll -= 400;
+        listScroll = Clampf(listScroll, 0, maxScroll);
+        bool mouseInView = CheckCollisionPointRec(GetMousePosition(), view);
+        bool savedLock = uiLocked;
+        uiLocked = uiLocked || !mouseInView;
+        BeginScissorMode((int)view.x, (int)view.y, (int)view.width, (int)view.height);
         for (int l = 0; l < LEVEL_COUNT; l++) {
-            float k = EaseOutBack(Clampf((e - 0.1f - l * 0.08f) / 0.45f, 0, 1));
+            float k = EaseOutBack(Clampf((e - 0.1f - (l < 6 ? l : 6) * 0.06f) / 0.45f, 0, 1));
             if (k <= 0.01f) continue;
-            Rectangle row = { 40 + (1.0f - k) * 700.0f, 84 + l * 90.0f, 920, 80 };
+            Rectangle row = { 40 + (1.0f - k) * 700.0f, 78 + l * rowH - listScroll, 900, 82 };
+            if (row.y + row.height < view.y || row.y > view.y + view.height) continue;
             DrawRoundOutlined(row, 18, 3, COLOR_CREAM, COLOR_INK);
             Color col = LevelColor(l);
-            DrawNgon(V2(row.x + 46, row.y + 40), 6, 28, 0, COLOR_INK);
-            DrawNgon(V2(row.x + 46, row.y + 40), 6, 25, 0, col);
+            DrawNgon(V2(row.x + 46, row.y + 41), 6, 28, 0, COLOR_INK);
+            DrawNgon(V2(row.x + 46, row.y + 41), 6, 25, 0, col);
             char n[4];
             snprintf(n, sizeof n, "%d", l + 1);
-            DrawTextCO(n, (int)row.x + 46, (int)row.y + 26, 28, WHITE, COLOR_INK);
-            DrawText(levelNames[l], (int)row.x + 92, (int)row.y + 12, 24, COLOR_TXT);
-            char blurb[120];
-            FitText(levelBlurbs[l], blurb, sizeof blurb, 440, 15);
-            DrawText(blurb, (int)row.x + 92, (int)row.y + 46, 15, COLOR_DIM);
-            if (DrawCandyButton((Rectangle){ row.x + 560, row.y + 12, 170, 56 }, "READ NOTES", col, true, 18)) { app.notesLevel = l; app.notesTab = 0; app.notesScroll = 0; }
+            textMode = 1;
+            TextDraw(n, (int)row.x + 46 - TextW(n, 28) / 2, (int)row.y + 26, 28, COLOR_INK);
+            TextDraw(levelNames[l], (int)row.x + 92, (int)row.y + 10, 26, WHITE);
+            char blurb[160];
+            FitText(levelBlurbs[l], blurb, sizeof blurb, 440, 17);
+            TextDraw(blurb, (int)row.x + 92, (int)row.y + 46, 17, (Color){ 176, 194, 226, 255 });
+            textMode = 0;
+            if (DrawCandyButton((Rectangle){ row.x + 560, row.y + 12, 160, 58 }, "READ NOTES", col, true, 17)) { app.notesLevel = l; app.notesTab = 0; app.notesScroll = 0; }
             char cards[32];
-            snprintf(cards, sizeof cards, "FLASHCARDS %d", cardCounts[l]);
-            if (DrawCandyButton((Rectangle){ row.x + 744, row.y + 12, 160, 56 }, cards, COLOR_PURPLE, true, 16)) { app.notesLevel = l; app.notesTab = 1; app.cardIndex = 0; app.cardFlipped = false; app.cardFlip = 0; }
+            snprintf(cards, sizeof cards, "FLASHCARDS (%d)", cardCounts[l]);
+            if (DrawCandyButton((Rectangle){ row.x + 730, row.y + 12, 160, 58 }, cards, COLOR_PURPLE, true, 16)) { app.notesLevel = l; app.notesTab = 1; app.cardIndex = 0; app.cardFlipped = false; app.cardFlip = 0; }
         }
-        DrawBot(880, 640, 0.55f, MOOD_HAPPY);
+        EndScissorMode();
+        uiLocked = savedLock;
+        if (maxScroll > 0) {
+            float barH = view.height * view.height / total;
+            DrawRound((Rectangle){ 982, view.y + (view.height - barH) * (listScroll / maxScroll), 6, barH }, 3, COLOR_CYAN);
+        }
+        DrawHeaderBar("STUDY NOTES", 122, true);
+        if (DrawCandyButton((Rectangle){ 12, 8, 100, 44 }, notesReturn == SCREEN_MAP ? "MAP" : "HOME", COLOR_ORANGE, true, 20) || IsKeyPressed(KEY_ESCAPE)) { SetScreen(notesReturn); return; }
         return;
     }
 
     // ---- reader
     int level = app.notesLevel;
     DrawHeaderBar(levelNames[level], 122, true);
-    if (DrawCandyButton((Rectangle){ 12, 8, 100, 44 }, "BACK", COLOR_ORANGE, true, 20) || IsKeyPressed(KEY_ESCAPE)) { app.notesLevel = -1; app.screenTime = 0.5f; return; }
+    if (DrawCandyButton((Rectangle){ 12, 8, 100, 44 }, notesReturn == SCREEN_MAP ? "MAP" : "BACK", COLOR_ORANGE, true, 20) || IsKeyPressed(KEY_ESCAPE)) {
+        if (notesReturn == SCREEN_MAP) { SetScreen(SCREEN_MAP); return; }   // opened from a level popup: straight back to the map
+        app.notesLevel = -1; app.screenTime = 0.5f; return;
+    }
     for (int tab = 0; tab < 2; tab++) {
         Rectangle r = { 30 + tab * 200.0f, 80, 190, 46 };
         if (DrawCandyButton(r, tab == 0 ? "NOTES" : "FLASHCARDS", tab == app.notesTab ? LevelColor(level) : COLOR_PURPLE, true, 20) && tab != app.notesTab) {
@@ -2487,8 +3741,18 @@ static void ScreenNotes(void) {
 
 // ================================================================ the two level maps
 // MCQ = "Neon Skyline" (night city and a glowing highway). TYPING = "Circuit City" (a circuit board with traces).
-static int MapCount(void) { return mapNodeCount[app.mode]; }
-static Vector2 NodeP(int level) { return nodePos[app.mode][level]; }
+// The road is wider than the window, so the map scrolls sideways (mouse wheel, arrow keys, the arrows at the edges or the track on top).
+#define MAP_STEP 232.0f
+#define MAP_WORLD_W (130.0f + (LEVEL_COUNT - 1) * MAP_STEP + 130.0f)
+static float mapScroll, mapScrollTarget;
+static int MapCount(void) { return LEVEL_COUNT; }
+static Vector2 NodeWorld(int level) {
+    static const float skyY[6] = { 440, 330, 445, 305, 425, 322 };
+    static const float chipY[6] = { 450, 345, 455, 335, 430, 300 };
+    return V2(130.0f + level * MAP_STEP, (app.mode == MODE_MCQ ? skyY : chipY)[level % 6]);
+}
+static Vector2 NodeP(int level) { Vector2 w = NodeWorld(level); return V2(w.x - mapScroll, w.y); }
+static float MapMaxScroll(void) { return MAP_WORLD_W - WINDOW_WIDTH; }
 
 static int CurrentLevelForMap(void) {
     int last = 0;
@@ -2518,11 +3782,14 @@ static Vector2 RoadPoint(int seg, float f) {
 // ---- backdrops
 static void DrawSkylineLayer(int seed, float baseY, int minH, int maxH, Color col, float parallax, float lit) {
     float shift = (GetMousePosition().x - 500) * parallax;
+    float world = -mapScroll * (parallax * 9.0f + 0.15f);   // nearer layers slide faster
+    int firstIndex = (int)(world / 38.0f);
     float t = (float)GetTime();
-    for (int i = -1; i < 30; i++) {
+    for (int n = -1; n < 30; n++) {
+        int i = n + firstIndex;
         unsigned int h = Hash2(i, seed);
         int w = 34 + (int)(h % 30), height = minH + (int)((h >> 6) % (unsigned)(maxH - minH));
-        float x = i * 38.0f + shift;
+        float x = n * 38.0f + fmodf(world, 38.0f) + shift;
         DrawRectangle((int)x, (int)(baseY - height), w, height + 240, col);
         DrawRectangle((int)x, (int)(baseY - height), w, 2, Fade(COLOR_CYAN, 0.10f + lit * 0.2f));
         if (lit > 0)
@@ -2570,29 +3837,35 @@ static void DrawSkyBackdrop(void) {
 static void DrawCircuitBackdrop(void) {
     float t = (float)GetTime();
     DrawRectangleGradientV(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT, (Color){ 6, 10, 30, 255 }, (Color){ 16, 16, 54, 255 });
-    for (int x = 0; x < WINDOW_WIDTH; x += 40) DrawRectangle(x, 0, 1, WINDOW_HEIGHT, Fade(COLOR_CYAN, 0.045f));
+    float gridShift = fmodf(mapScroll * 0.5f, 40.0f), chipShift = fmodf(mapScroll * 0.5f, 1000.0f);
+    for (float x = -gridShift; x < WINDOW_WIDTH; x += 40) DrawRectangle((int)x, 0, 1, WINDOW_HEIGHT, Fade(COLOR_CYAN, 0.045f));
     for (int y = 0; y < WINDOW_HEIGHT; y += 40) DrawRectangle(0, y, WINDOW_WIDTH, 1, Fade(COLOR_CYAN, 0.045f));
     static const Rectangle chips[] = { { 36, 92, 130, 76 }, { 424, 92, 150, 80 }, { 764, 452, 150, 92 }, { 236, 500, 120, 58 }, { 604, 92, 86, 58 }, { 930, 330, 60, 100 }, { 20, 250, 60, 90 } };
     static const char *labels[] = { "CPU", "RAM", "I/O", "GPU", "ROM", "NET", "SYS" };
-    for (int i = 0; i < 7; i++) {
-        Rectangle c = chips[i];
+    for (int i = 0; i < 14; i++) {
+        Rectangle c = chips[i % 7];
+        c.x += (i / 7) * 1000.0f - chipShift;
+        if (c.x + c.width < 0 || c.x > WINDOW_WIDTH) continue;
         DrawRoundOutlined(c, 8, 2, (Color){ 12, 18, 48, 255 }, Fade(COLOR_PURPLE, 0.5f));
         DrawRectangleLinesEx((Rectangle){ c.x + 10, c.y + 10, c.width - 20, c.height - 20 }, 1, Fade(COLOR_CYAN, 0.25f));
         for (float p = c.x + 10; p < c.x + c.width - 6; p += 12) { DrawRectangle((int)p, (int)c.y - 5, 4, 5, Fade(COLOR_CYAN, 0.3f)); DrawRectangle((int)p, (int)(c.y + c.height), 4, 5, Fade(COLOR_CYAN, 0.3f)); }
-        DrawText(labels[i], (int)(c.x + c.width / 2) - MeasureText(labels[i], 14) / 2, (int)(c.y + c.height / 2) - 7, 14, Fade(COLOR_CYAN, 0.45f));
+        DrawText(labels[i % 7], (int)(c.x + c.width / 2) - MeasureText(labels[i % 7], 14) / 2, (int)(c.y + c.height / 2) - 7, 14, Fade(COLOR_CYAN, 0.45f));
     }
     // background traces with moving data bits
     static const Vector2 traces[4][4] = {
         { {0, 200}, {260, 200}, {300, 240}, {300, 330} }, { {1000, 560}, {800, 560}, {760, 600}, {600, 600} },
         { {0, 600}, {170, 600}, {210, 560}, {210, 520} }, { {1000, 140}, {900, 140}, {870, 170}, {700, 170} },
     };
-    for (int k = 0; k < 4; k++) {
-        for (int i = 0; i < 3; i++) DrawLineEx(traces[k][i], traces[k][i + 1], 2, Fade(COLOR_PURPLE, 0.22f));
-        DrawCircleV(traces[k][3], 4, Fade(COLOR_CYAN, 0.35f));
-        float f = fmodf(t * 0.25f + k * 0.27f, 1.0f) * 3.0f;
-        int seg = (int)f;
-        Vector2 a = traces[k][seg], b = traces[k][seg + 1];
-        DrawCircleV(V2(a.x + (b.x - a.x) * (f - seg), a.y + (b.y - a.y) * (f - seg)), 3, Fade(COLOR_CYAN, 0.7f));
+    for (int pass = 0; pass < 2; pass++) {
+        float ox = pass * 1000.0f - chipShift;
+        for (int k = 0; k < 4; k++) {
+            for (int i = 0; i < 3; i++) DrawLineEx(V2(traces[k][i].x + ox, traces[k][i].y), V2(traces[k][i + 1].x + ox, traces[k][i + 1].y), 2, Fade(COLOR_PURPLE, 0.22f));
+            DrawCircleV(V2(traces[k][3].x + ox, traces[k][3].y), 4, Fade(COLOR_CYAN, 0.35f));
+            float f = fmodf(t * 0.25f + k * 0.27f, 1.0f) * 3.0f;
+            int seg = (int)f;
+            Vector2 a = traces[k][seg], b = traces[k][seg + 1];
+            DrawCircleV(V2(a.x + ox + (b.x - a.x) * (f - seg), a.y + (b.y - a.y) * (f - seg)), 3, Fade(COLOR_CYAN, 0.7f));
+        }
     }
 }
 
@@ -2627,7 +3900,7 @@ static void DrawRoad(void) {
 // ---- level node: hex badge on a glowing platform (MCQ) or a chip on a pad (typing)
 static void DrawLevelNode(Vector2 c, int level, bool locked, int gems, bool isCurrent, bool hovered) {
     float t = (float)GetTime();
-    bool boss = app.mode == MODE_TYPED && level == LEVEL_COUNT - 1;
+    bool boss = level == LEVEL_COUNT - 1;
     float r = boss ? 46.0f : 37.0f;
     float pop = EaseOutBack(Clampf((app.screenTime - 0.25f - level * 0.1f) / 0.45f, 0, 1));
     if (pop < 0.02f) return;
@@ -2648,7 +3921,7 @@ static void DrawLevelNode(Vector2 c, int level, bool locked, int gems, bool isCu
     }
     c.y += bounce;
     if (isCurrent) DrawNgonLines(c, 6, r + 12 + sinf(t * 6) * 3, 0, 2, Fade(COLOR_TXT, 0.8f));
-    if (app.mode == MODE_MCQ || boss) {
+    if (app.mode == MODE_MCQ || boss) {   // MCQ levels are hex badges; the last level is a hex "boss" in both maps
         DrawNgon(c, 6, r + 5, 0, COLOR_INK);
         DrawNgon(c, 6, r + 2, 0, col);
         DrawNgon(c, 6, r - 4, 0, COLOR_INK);
@@ -2711,6 +3984,7 @@ static void DrawLevelPopup(void) {
     if (DrawCandyButton((Rectangle){ p.x + 90, p.y + 282, 240, 64 }, label, COLOR_GREEN, unlocked, 32) || (unlocked && IsKeyPressed(KEY_ENTER))) StartLevel(level);
     if (DrawCandyButton((Rectangle){ p.x + 90, p.y + 340, 240, 44 }, "STUDY NOTES FIRST", COLOR_CYAN, true, 16)) {
         app.notesLevel = level; app.notesTab = 0; app.notesScroll = 0; app.selectedLevel = -1;
+        notesReturn = SCREEN_MAP;
         SetScreen(SCREEN_NOTES);
         return;
     }
@@ -2722,7 +3996,7 @@ static void DrawLevelPopup(void) {
 }
 
 static void ScreenMap(void) {
-    float t = (float)GetTime(), dt = GetFrameTime();
+    float dt = GetFrameTime();
     // robot hops to the level that just unlocked, then (optionally) its popup opens
     if (app.pendingHop >= 0 && app.hopTo < 0) { app.hopFrom = app.pendingHop; app.hopTo = app.hopFrom + 1; app.hopTime = -0.7f; app.pendingHop = -1; }
     if (app.hopTo >= 0) {
@@ -2740,22 +4014,38 @@ static void ScreenMap(void) {
         app.autoOpenLevel = -1;
     }
 
-    if (app.mode == MODE_MCQ) DrawSkyBackdrop(); else DrawCircuitBackdrop();
-    if (app.mode == MODE_MCQ) {   // glowing gate at the end of the skyline road
-        Vector2 g = V2(925, 372);
-        DrawRing(g, 26, 31, 0, 360, 36, Fade(COLOR_CYAN, 0.55f + 0.2f * sinf(t * 2)));
-        DrawRing(g, 14, 17, 0, 360, 28, Fade(COLOR_PURPLE, 0.7f));
-        DrawCircleV(g, 9, Fade(COLOR_TXT, 0.35f + 0.25f * sinf(t * 3)));
-        DrawTextCentered("TYPING MAP", (int)g.x, (int)g.y + 40, 13, Fade(COLOR_TXT, 0.7f));
+    // ---- sideways scrolling: centre on the current level at first, follow the hopping robot, then obey the player
+    float maxScroll = MapMaxScroll();
+    if (mapNeedsCenter) {
+        mapNeedsCenter = false;
+        int focus = app.pendingHop >= 0 ? app.pendingHop : (app.autoOpenLevel >= 0 ? app.autoOpenLevel : (app.levelIndex >= 0 ? app.levelIndex : CurrentLevelForMap()));
+        mapScrollTarget = Clampf(NodeWorld(focus).x - 460, 0, maxScroll);
+        mapScroll = mapScrollTarget;
     }
+    bool mapFree = app.selectedLevel < 0 && app.hopTo < 0 && !app.nameModal && !blockAll;
+    if (app.hopTo >= 0) {
+        float f = Clampf(app.hopTime / 1.5f, 0, 1);
+        mapScrollTarget = Clampf(RoadPoint(app.hopFrom, f).x + mapScroll - 460, 0, maxScroll);
+    } else if (mapFree) {
+        mapScrollTarget -= GetMouseWheelMove() * 170;
+        if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D)) mapScrollTarget += 760 * dt;
+        if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A)) mapScrollTarget -= 760 * dt;
+    }
+    mapScrollTarget = Clampf(mapScrollTarget, 0, maxScroll);
+    mapScroll += (mapScrollTarget - mapScroll) * Clampf(dt * 9.0f, 0, 1);
+    if (fabsf(mapScrollTarget - mapScroll) < 0.4f) mapScroll = mapScrollTarget;
+
+    if (app.mode == MODE_MCQ) DrawSkyBackdrop(); else DrawCircuitBackdrop();
 
     uiLocked = app.selectedLevel >= 0 || app.hopTo >= 0 || app.nameModal;
+    Rectangle arrowL = { 4, 250, 44, 96 }, arrowR = { WINDOW_WIDTH - 48, 250, 44, 96 };
     DrawRoad();
     int current = CurrentLevelForMap();
     int hoveredLevel = -1;
     for (int level = 0; level < MapCount(); level++) {
         bool unlocked = IsLevelUnlocked(app.mode, level);
-        bool hovered = !uiLocked && CheckCollisionPointCircle(GetMousePosition(), NodeP(level), level == LEVEL_COUNT - 1 && app.mode == MODE_TYPED ? 50 : 42);
+        bool overArrow = CheckCollisionPointRec(GetMousePosition(), arrowL) || CheckCollisionPointRec(GetMousePosition(), arrowR) || GetMouseY() < 100;
+        bool hovered = !uiLocked && !blockAll && !overArrow && CheckCollisionPointCircle(GetMousePosition(), NodeP(level), level == LEVEL_COUNT - 1 ? 50 : 42);
         if (hovered) hoveredLevel = level;
         DrawLevelNode(NodeP(level), level, !MapUnlocked(level), app.progress.bestGems[app.mode][level], level == current && MapUnlocked(level), hovered);
         if (TakeClick(hovered)) {
@@ -2779,9 +4069,33 @@ static void ScreenMap(void) {
     }
     DrawBot(botFoot.x, botFoot.y, 0.62f, botMood);
 
+    // ---- scroll arrows and the level track (jump anywhere on the road)
+    if (app.hopTo < 0) {
+        if (mapScrollTarget > 1 && DrawCandyButton(arrowL, "<", COLOR_CYAN, true, 30) && mapFree) mapScrollTarget -= 460;
+        if (mapScrollTarget < maxScroll - 1 && DrawCandyButton(arrowR, ">", COLOR_CYAN, true, 30) && mapFree) mapScrollTarget += 460;
+    }
+    {
+        Rectangle track = { 40, 74, 920, 14 };
+        bool overTrack = HoverRect(Expand(track, 6));
+        DrawRound(track, 6, Fade(COLOR_INK, 0.7f));
+        for (int l = 0; l < LEVEL_COUNT; l++) {
+            float x = track.x + NodeWorld(l).x / MAP_WORLD_W * track.width;
+            bool open = IsLevelUnlocked(app.mode, l);
+            Color c = app.progress.bestGems[app.mode][l] > 0 ? COLOR_GREEN : (open ? LevelColor(l) : (Color){ 70, 78, 124, 255 });
+            DrawCircleV(V2(x, track.y + 7), l == CurrentLevelForMap() ? 5.0f : 3.5f, c);
+        }
+        float viewW = track.width * WINDOW_WIDTH / MAP_WORLD_W;
+        Rectangle thumb = { track.x + mapScroll / MAP_WORLD_W * track.width, track.y - 1, viewW, track.height + 2 };
+        DrawRectangleLinesEx(thumb, 2, Fade(COLOR_CYAN, overTrack ? 1.0f : 0.7f));
+        if (overTrack) wantHand = true;
+        if (overTrack && mapFree && IsMouseButtonDown(MOUSE_BUTTON_LEFT) && !clickConsumed)
+            mapScrollTarget = Clampf((GetMouseX() - track.x) / track.width * MAP_WORLD_W - WINDOW_WIDTH / 2.0f, 0, maxScroll);
+    }
+
     DrawHeaderBar(app.mode == MODE_MCQ ? "NEON SKYLINE" : "CIRCUIT CITY", 122, true);
-    if (DrawCandyButton((Rectangle){ 12, 8, 100, 44 }, "BACK", COLOR_ORANGE, true, 20)) SetScreen(SCREEN_HUB);
+    if (DrawCandyButton((Rectangle){ 12, 8, 100, 44 }, "HOME", COLOR_ORANGE, true, 20)) SetScreen(SCREEN_TITLE);
     DrawText(app.mode == MODE_MCQ ? "MCQ MAP" : "TYPING MAP", 470, 22, 18, COLOR_DIM);
+    if (DrawSaveButton((Rectangle){ 598, 8, 92, 44 })) SaveNow();
 
     int weakIds[MAX_QUESTIONS_PER_LEVEL];
     int weakCount = CollectWeak(weakIds, MAX_QUESTIONS_PER_LEVEL);
@@ -2796,18 +4110,299 @@ static void ScreenMap(void) {
     }
     if (app.unlockLevel >= 0) {
         float a = Smooth(app.unlockTime / 0.3f) * (1.0f - Smooth((app.unlockTime - 2.0f) / 0.4f));
-        Rectangle banner = { 290, 84 - 70 * (1 - a), 420, 50 };
+        Rectangle banner = { 290, 100 - 110 * (1 - a), 420, 50 };
         char text[64];
         snprintf(text, sizeof text, "LEVEL %d UNLOCKED!", app.unlockLevel + 1);
         DrawRoundOutlined(banner, 16, 3, COLOR_CREAM, COLOR_CYAN);
         DrawTextCO(text, 500, (int)banner.y + 12, 26, COLOR_CYAN, COLOR_INK);
     }
-    if (IsKeyPressed(KEY_ESCAPE) && app.selectedLevel < 0 && app.hopTo < 0) SetScreen(SCREEN_HUB);
+    if (IsKeyPressed(KEY_ESCAPE) && app.selectedLevel < 0 && app.hopTo < 0 && !app.nameModal) SetScreen(SCREEN_TITLE);
 
     if (app.selectedLevel >= 0) {
         uiLocked = false;
         DrawLevelPopup();
     }
+    DrawNameModal();
+}
+// ================================================================ crown icon, HP / stars panel and the wardrobe
+static void DrawCrownIcon(Vector2 c, float s, bool lit) {
+    Color gold = lit ? (Color){ 255, 214, 92, 255 } : (Color){ 84, 92, 138, 255 };
+    Color dark = lit ? (Color){ 214, 150, 40, 255 } : (Color){ 58, 64, 104, 255 };
+    DrawRectangle((int)(c.x - 14 * s), (int)(c.y + 2 * s), (int)(28 * s), (int)(8 * s), gold);
+    DrawTriSafe(V2(c.x - 14 * s, c.y + 3 * s), V2(c.x - 14 * s, c.y - 11 * s), V2(c.x - 5 * s, c.y + 3 * s), gold);
+    DrawTriSafe(V2(c.x - 7 * s, c.y + 3 * s), V2(c.x, c.y - 14 * s), V2(c.x + 7 * s, c.y + 3 * s), gold);
+    DrawTriSafe(V2(c.x + 14 * s, c.y + 3 * s), V2(c.x + 14 * s, c.y - 11 * s), V2(c.x + 5 * s, c.y + 3 * s), gold);
+    DrawRectangle((int)(c.x - 14 * s), (int)(c.y + 8 * s), (int)(28 * s), (int)(2 * s), dark);
+    DrawCircleV(V2(c.x, c.y - 14 * s), 2.2f * s, lit ? COLOR_CYAN : dark);
+    DrawCircleV(V2(c.x - 14 * s, c.y - 11 * s), 2 * s, lit ? COLOR_PINK : dark);
+    DrawCircleV(V2(c.x + 14 * s, c.y - 11 * s), 2 * s, lit ? COLOR_PINK : dark);
+}
+
+static int StarsFor(int mode, int *maxStars) {
+    int stars = 0;
+    for (int l = 0; l < LEVEL_COUNT; l++) stars += app.progress.bestGems[mode][l];
+    *maxStars = LEVEL_COUNT * 3;
+    return stars;
+}
+
+// Opened by clicking the HP / stars chips in any header. Drawn on top of whatever screen is showing.
+static void DrawStatsPanel(void) {
+    if (!app.statsOpen) return;
+    Rectangle p = { 520, 62, 462, 436 };
+    Vector2 m = GetMousePosition();
+    bool outside = !CheckCollisionPointRec(m, p);
+    DrawRectangle(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT, Fade(COLOR_INK, 0.45f));
+    DrawRound((Rectangle){ p.x + 4, p.y + 10, p.width, p.height }, 24, Fade(BLACK, 0.3f));
+    DrawRoundOutlined(p, 24, 4, COLOR_CREAM, COLOR_CYAN);
+    int hp = app.progress.totalXp, rank = RankIndex(hp);
+    char fitted[40];
+    FitText(PlayerName(), fitted, sizeof fitted, 250, 22);
+    textMode = 1;
+    TextDraw(fitted, (int)p.x + 22, (int)p.y + 14, 24, WHITE);
+    textMode = 0;
+    DrawText("PLAYER STATS", (int)p.x + 22, (int)p.y + 46, 14, COLOR_PURPLE);
+    Rectangle closeBtn = { p.x + p.width - 52, p.y + 10, 40, 36 };
+    bool closeHover = HoverRect(closeBtn);
+    DrawRoundOutlined(closeBtn, 10, 2, closeHover ? (Color){ 60, 24, 60, 255 } : (Color){ 20, 24, 56, 255 }, closeHover ? COLOR_RED : (Color){ 60, 66, 128, 255 });
+    DrawLineEx(V2(closeBtn.x + 12, closeBtn.y + 10), V2(closeBtn.x + 28, closeBtn.y + 26), 3, closeHover ? COLOR_RED : COLOR_GRAY);
+    DrawLineEx(V2(closeBtn.x + 12, closeBtn.y + 26), V2(closeBtn.x + 28, closeBtn.y + 10), 3, closeHover ? COLOR_RED : COLOR_GRAY);
+    bool close = TakeClick(closeHover);
+
+    // ---- HP and rank
+    float y = p.y + 78;
+    DrawNgon(V2(p.x + 40, y + 24), 6, 22, 0, COLOR_CYAN);
+    DrawNgon(V2(p.x + 40, y + 24), 6, 11, 0, COLOR_CREAM);
+    char line[96];
+    snprintf(line, sizeof line, "%d HP", hp);
+    DrawText(line, (int)p.x + 76, (int)y + 2, 34, WHITE);
+    DrawText(rankNames[rank], (int)p.x + 76, (int)y + 40, 18, COLOR_CYAN);
+    Rectangle bar = { p.x + 22, y + 68, p.width - 44, 10 };
+    DrawRectangleRec(bar, Fade(COLOR_CYAN, 0.18f));
+    DrawRectangleRec((Rectangle){ bar.x, bar.y, bar.width * RankProgress(hp), bar.height }, COLOR_CYAN);
+    textMode = 1;
+    if (rank < RANK_COUNT - 1) snprintf(line, sizeof line, "%d more HP to become %s", rankHp[rank + 1] - hp, rankNames[rank + 1]);
+    else snprintf(line, sizeof line, "Top rank reached. Legend!");
+    TextDraw(line, (int)p.x + 22, (int)y + 84, 17, COLOR_DIM);
+
+    // ---- next reward (booster + accessory)
+    y += 118;
+    DrawLineEx(V2(p.x + 22, y - 8), V2(p.x + p.width - 22, y - 8), 1, Fade(COLOR_PURPLE, 0.5f));
+    textMode = 0;
+    DrawText("NEXT REWARD", (int)p.x + 22, (int)y, 14, COLOR_PURPLE);
+    textMode = 1;
+    if (app.progress.milestone < MILESTONE_COUNT) {
+        int m2 = app.progress.milestone, next = milestoneHp[m2];
+        snprintf(line, sizeof line, "%s + boosters at %d HP  (%d to go)", m2 < ACC_COUNT ? accessories[m2].name : "A booster", next, next - hp > 0 ? next - hp : 0);
+        TextDraw(line, (int)p.x + 22, (int)y + 20, 18, COLOR_TXT);
+        float from = m2 > 0 ? (float)milestoneHp[m2 - 1] : 0;
+        Rectangle b2 = { p.x + 22, y + 46, p.width - 44, 8 };
+        DrawRectangleRec(b2, Fade(COLOR_PURPLE, 0.22f));
+        DrawRectangleRec((Rectangle){ b2.x, b2.y, b2.width * Clampf((hp - from) / (next - from), 0, 1), b2.height }, COLOR_PURPLE);
+    } else TextDraw("Every reward unlocked!", (int)p.x + 22, (int)y + 20, 18, COLOR_TXT);
+
+    // ---- stars
+    y += 76;
+    DrawLineEx(V2(p.x + 22, y - 8), V2(p.x + p.width - 22, y - 8), 1, Fade(COLOR_PURPLE, 0.5f));
+    textMode = 0;
+    DrawText("STARS", (int)p.x + 22, (int)y, 14, COLOR_PURPLE);
+    for (int mode = 0; mode < MODE_COUNT; mode++) {
+        int maxStars, stars = StarsFor(mode, &maxStars);
+        float rowY = y + 20 + mode * 30;
+        DrawStarShape(V2(p.x + 34, rowY + 11), 10, 0, COLOR_YELLOW);
+        textMode = 1;
+        snprintf(line, sizeof line, "%s  %d / %d", mode == MODE_MCQ ? "MCQ map" : "Typing map", stars, maxStars);
+        TextDraw(line, (int)p.x + 54, (int)rowY, 17, COLOR_TXT);
+        textMode = 0;
+        Rectangle sb = { p.x + 250, rowY + 6, p.width - 272, 9 };
+        DrawRectangleRec(sb, Fade(COLOR_YELLOW, 0.18f));
+        DrawRectangleRec((Rectangle){ sb.x, sb.y, sb.width * (float)stars / (float)maxStars, sb.height }, COLOR_YELLOW);
+    }
+
+    // ---- crown and wardrobe
+    y += 88;
+    DrawLineEx(V2(p.x + 22, y - 8), V2(p.x + p.width - 22, y - 8), 1, Fade(COLOR_PURPLE, 0.5f));
+    DrawCrownIcon(V2(p.x + 42, y + 22), 1.1f, app.progress.crown != 0);
+    textMode = 1;
+    if (app.progress.crown) TextDraw("Crown ON - one mistake and it is gone!", (int)p.x + 76, (int)y + 2, 17, COLOR_YELLOW);
+    else TextDraw("No crown. Clear a level with every answer right.", (int)p.x + 76, (int)y + 2, 17, COLOR_DIM);
+    int owned = 0;
+    for (int i = 0; i < ACC_COUNT; i++) if (app.progress.owned & (1u << i)) owned++;
+    snprintf(line, sizeof line, "Crowns won: %d     Accessories: %d / %d", app.progress.crownsEarned, owned, ACC_COUNT);
+    TextDraw(line, (int)p.x + 76, (int)y + 26, 17, COLOR_TXT);
+    textMode = 0;
+
+    if (close || (outside && !statsFresh && IsMouseButtonReleased(MOUSE_BUTTON_LEFT))) { app.statsOpen = false; PlayFx(FX_BLIP); }
+    statsFresh = false;
+}
+
+// ---------------------------------------------------------------- wardrobe
+static void DrawAccIcon(int acc, Vector2 c, float s, bool locked) {
+    Color a = locked ? (Color){ 60, 68, 110, 255 } : (Color){ 110, 142, 255, 255 };
+    Color b = locked ? (Color){ 48, 54, 92, 255 } : (Color){ 62, 206, 210, 255 };
+    Color g = locked ? (Color){ 70, 78, 120, 255 } : (Color){ 255, 214, 92, 255 };
+    Color d = locked ? (Color){ 40, 46, 80, 255 } : (Color){ 22, 26, 56, 255 };
+    Color o = locked ? (Color){ 66, 72, 112, 255 } : (Color){ 196, 128, 232, 255 };
+    switch (acc) {
+        case ACC_CAP:
+            DrawCircleSector(V2(c.x, c.y + 6 * s), 22 * s, 270, 450, 20, a);
+            DrawRectangle((int)(c.x - 2 * s), (int)(c.y + 2 * s), (int)(28 * s), (int)(6 * s), Mix(a, 0.7f));
+            DrawCircleV(V2(c.x, c.y - 17 * s), 2.5f * s, WHITE);
+            break;
+        case ACC_SHADES:
+            DrawRoundOutlined((Rectangle){ c.x - 26 * s, c.y - 8 * s, 22 * s, 16 * s }, 6 * s, 2, d, COLOR_INK);
+            DrawRoundOutlined((Rectangle){ c.x + 4 * s, c.y - 8 * s, 22 * s, 16 * s }, 6 * s, 2, d, COLOR_INK);
+            DrawRectangle((int)(c.x - 4 * s), (int)(c.y - 4 * s), (int)(8 * s), (int)(3 * s), d);
+            DrawRectangle((int)(c.x - 22 * s), (int)(c.y - 5 * s), (int)(10 * s), (int)(2 * s), b);
+            break;
+        case ACC_BOWTIE:
+            DrawTriSafe(V2(c.x, c.y), V2(c.x - 24 * s, c.y - 13 * s), V2(c.x - 24 * s, c.y + 13 * s), o);
+            DrawTriSafe(V2(c.x, c.y), V2(c.x + 24 * s, c.y - 13 * s), V2(c.x + 24 * s, c.y + 13 * s), o);
+            DrawCircleV(c, 6 * s, Mix(o, 0.7f));
+            break;
+        case ACC_WIZARD:
+            DrawTriSafe(V2(c.x - 15 * s, c.y + 12 * s), V2(c.x + 15 * s, c.y + 12 * s), V2(c.x + 6 * s, c.y - 24 * s), Mix(o, 0.8f));
+            DrawEllipse((int)c.x, (int)(c.y + 13 * s), 26 * s, 6 * s, Mix(o, 0.6f));
+            DrawStarShape(V2(c.x + 1 * s, c.y - 2 * s), 5 * s, 0, g);
+            break;
+        case ACC_CAPE:
+            DrawTriSafe(V2(c.x - 14 * s, c.y - 20 * s), V2(c.x + 14 * s, c.y - 20 * s), V2(c.x + 24 * s, c.y + 22 * s), Mix(o, 0.8f));
+            DrawTriSafe(V2(c.x - 14 * s, c.y - 20 * s), V2(c.x + 24 * s, c.y + 22 * s), V2(c.x - 24 * s, c.y + 22 * s), o);
+            DrawCircleV(V2(c.x - 13 * s, c.y - 20 * s), 3.5f * s, g);
+            DrawCircleV(V2(c.x + 13 * s, c.y - 20 * s), 3.5f * s, g);
+            break;
+        case ACC_NERD:
+            DrawRing(V2(c.x - 14 * s, c.y), 9 * s, 12 * s, 0, 360, 20, o);
+            DrawRing(V2(c.x + 14 * s, c.y), 9 * s, 12 * s, 0, 360, 20, o);
+            DrawRectangle((int)(c.x - 3 * s), (int)(c.y - 2 * s), (int)(6 * s), (int)(3 * s), o);
+            break;
+        case ACC_PHONES:
+            DrawRing(V2(c.x, c.y + 6 * s), 18 * s, 22 * s, 180, 360, 20, Mix(a, 0.8f));
+            DrawRoundOutlined((Rectangle){ c.x - 28 * s, c.y + 2 * s, 12 * s, 22 * s }, 5 * s, 2, b, COLOR_INK);
+            DrawRoundOutlined((Rectangle){ c.x + 16 * s, c.y + 2 * s, 12 * s, 22 * s }, 5 * s, 2, b, COLOR_INK);
+            break;
+        case ACC_SCARF:
+            DrawRoundOutlined((Rectangle){ c.x - 26 * s, c.y - 8 * s, 52 * s, 14 * s }, 6 * s, 2, b, COLOR_INK);
+            for (int i = 0; i < 4; i++) DrawRectangle((int)(c.x - 18 * s + i * 12 * s), (int)(c.y - 6 * s), (int)(5 * s), (int)(10 * s), a);
+            DrawRoundOutlined((Rectangle){ c.x + 8 * s, c.y + 2 * s, 12 * s, 24 * s }, 4 * s, 2, a, COLOR_INK);
+            break;
+        case ACC_VISOR:
+            DrawRoundOutlined((Rectangle){ c.x - 28 * s, c.y - 9 * s, 56 * s, 18 * s }, 8 * s, 2, Fade(b, 0.8f), COLOR_INK);
+            DrawRectangle((int)(c.x - 20 * s), (int)(c.y - 4 * s), (int)(30 * s), (int)(2 * s), WHITE);
+            break;
+        case ACC_TOPHAT:
+            DrawRectangle((int)(c.x - 14 * s), (int)(c.y - 22 * s), (int)(28 * s), (int)(30 * s), d);
+            DrawEllipse((int)c.x, (int)(c.y + 9 * s), 26 * s, 6 * s, d);
+            DrawRectangle((int)(c.x - 14 * s), (int)(c.y + 0 * s), (int)(28 * s), (int)(5 * s), b);
+            break;
+        case ACC_JETPACK:
+            DrawRoundOutlined((Rectangle){ c.x - 22 * s, c.y - 18 * s, 18 * s, 34 * s }, 7 * s, 2, (Color){ 176, 188, 218, 255 }, COLOR_INK);
+            DrawRoundOutlined((Rectangle){ c.x + 4 * s, c.y - 18 * s, 18 * s, 34 * s }, 7 * s, 2, (Color){ 176, 188, 218, 255 }, COLOR_INK);
+            DrawTriSafe(V2(c.x - 20 * s, c.y + 17 * s), V2(c.x - 6 * s, c.y + 17 * s), V2(c.x - 13 * s, c.y + 30 * s), b);
+            DrawTriSafe(V2(c.x + 6 * s, c.y + 17 * s), V2(c.x + 20 * s, c.y + 17 * s), V2(c.x + 13 * s, c.y + 30 * s), b);
+            break;
+        case ACC_MEDAL:
+            DrawTriSafe(V2(c.x - 12 * s, c.y - 24 * s), V2(c.x + 2 * s, c.y - 24 * s), V2(c.x + 2 * s, c.y), a);
+            DrawTriSafe(V2(c.x + 12 * s, c.y - 24 * s), V2(c.x - 2 * s, c.y - 24 * s), V2(c.x - 2 * s, c.y), Mix(a, 0.7f));
+            DrawCircleV(V2(c.x, c.y + 8 * s), 14 * s, g);
+            DrawCircleV(V2(c.x, c.y + 8 * s), 8 * s, Mix(g, 0.8f));
+            break;
+        case ACC_WINGS:
+            for (int k = 0; k < 3; k++) {
+                DrawEllipse((int)(c.x - 16 * s - k * 3 * s), (int)(c.y - 8 * s + k * 9 * s), 18 * s, 5 * s, locked ? a : WHITE);
+                DrawEllipse((int)(c.x + 16 * s + k * 3 * s), (int)(c.y - 8 * s + k * 9 * s), 18 * s, 5 * s, locked ? a : WHITE);
+            }
+            break;
+        case ACC_PROP:
+            DrawCircleSector(V2(c.x, c.y + 10 * s), 20 * s, 270, 450, 20, o);
+            DrawRectangle((int)(c.x - 1.5f * s), (int)(c.y - 12 * s), (int)(3 * s), (int)(6 * s), WHITE);
+            DrawEllipse((int)(c.x - 11 * s), (int)(c.y - 13 * s), 11 * s, 3 * s, b);
+            DrawEllipse((int)(c.x + 11 * s), (int)(c.y - 13 * s), 11 * s, 3 * s, a);
+            break;
+    }
+}
+
+static void ScreenWardrobe(void) {
+    DrawBackground(0.42f);
+    buttonPlain = true;
+    float e = app.screenTime;
+    static float cheer;
+    cheer -= GetFrameTime();
+    DrawHeaderBar("WARDROBE", 122, true);
+    if (DrawCandyButton((Rectangle){ 12, 8, 100, 44 }, "HOME", COLOR_ORANGE, true, 20) || IsKeyPressed(KEY_ESCAPE)) { SetScreen(SCREEN_TITLE); return; }
+
+    // left: Byte on a stage
+    Rectangle stage = { 30, 80, 400, 548 };
+    DrawRoundOutlined(stage, 24, 4, COLOR_CREAM, COLOR_INK);
+    DrawEllipse(230, 560, 150, 24, Fade(COLOR_CYAN, 0.25f));
+    DrawEllipseLines(230, 560, 150, 24, Fade(COLOR_CYAN, 0.7f));
+    DrawBot(230, 556, 2.15f, cheer > 0 ? MOOD_CHEER : MOOD_HAPPY);
+    textMode = 1;
+    TextDraw("Byte's wardrobe", 52, 94, 22, COLOR_TXT);
+    textMode = 0;
+    DrawCrownIcon(V2(370, 106), 0.9f, app.progress.crown != 0);
+    int owned = 0;
+    for (int i = 0; i < ACC_COUNT; i++) if (app.progress.owned & (1u << i)) owned++;
+    char line[96];
+    snprintf(line, sizeof line, "%d / %d collected", owned, ACC_COUNT);
+    textMode = 1;
+    TextDraw(line, 52, 122, 17, COLOR_DIM);
+    TextDraw(app.progress.crown ? "Crown on! Keep every answer right." : "Crown: clear a level with no mistakes!", 52, 590, 16, app.progress.crown ? COLOR_YELLOW : COLOR_DIM);
+    textMode = 0;
+
+    // right: slot tabs and items
+    Rectangle panel = { 450, 80, 520, 548 };
+    DrawRoundOutlined(panel, 24, 4, COLOR_CREAM, COLOR_INK);
+    for (int s = 0; s < SLOT_COUNT; s++) {
+        Rectangle tab = { panel.x + 14 + s * 125.0f, panel.y + 14, 118, 44 };
+        if (DrawCandyButton(tab, slotNames[s], s == app.wardrobeSlot ? COLOR_CYAN : COLOR_PURPLE, true, 18)) app.wardrobeSlot = s;
+    }
+    int shown = 0;
+    for (int acc = 0; acc < ACC_COUNT; acc++) {
+        if (accessories[acc].slot != app.wardrobeSlot) continue;
+        float k = EaseOutBack(Clampf((e - 0.1f - shown * 0.06f) / 0.4f, 0, 1));
+        Rectangle card = { panel.x + 14 + (shown % 3) * 166.0f, panel.y + 74 + (shown / 3) * 188.0f + (1.0f - k) * 40.0f, 158, 178 };
+        shown++;
+        if (k < 0.05f) continue;
+        bool have = (app.progress.owned & (1u << acc)) != 0;
+        bool worn = app.progress.equipped[accessories[acc].slot] == acc + 1;
+        bool hovered = HoverRect(card);
+        Color edge = worn ? COLOR_GREEN : (have ? (hovered ? COLOR_CYAN : (Color){ 64, 76, 140, 255 }) : (Color){ 44, 50, 90, 255 });
+        DrawRoundOutlined(card, 16, 3, worn ? (Color){ 12, 44, 48, 255 } : (Color){ 16, 22, 52, 255 }, edge);
+        DrawAccIcon(acc, V2(card.x + card.width / 2, card.y + 56), 1.15f, !have);
+        if (!have) DrawPadlock(V2(card.x + card.width - 26, card.y + 28), 0.9f, COLOR_GRAY);
+        textMode = 1;
+        char fitted[40];
+        FitText(have ? accessories[acc].name : "???", fitted, sizeof fitted, 140, 19);
+        TextDraw(fitted, (int)(card.x + card.width / 2) - TextW(fitted, 19) / 2, (int)card.y + 102, 19, have ? WHITE : COLOR_GRAY);
+        if (have) snprintf(line, sizeof line, "%s", worn ? "WEARING" : "tap to wear");
+        else snprintf(line, sizeof line, "unlocks at %d HP", milestoneHp[acc]);
+        FitText(line, fitted, sizeof fitted, 144, 15);
+        TextDraw(fitted, (int)(card.x + card.width / 2) - TextW(fitted, 15) / 2, (int)card.y + 130, 15, worn ? COLOR_GREEN : (have ? COLOR_CYAN : COLOR_DIM));
+        if (have) {
+            const char *blurb = accessories[acc].blurb;
+            FitText(blurb, fitted, sizeof fitted, 144, 13);
+            TextDraw(fitted, (int)(card.x + card.width / 2) - TextW(fitted, 13) / 2, (int)card.y + 152, 13, COLOR_DIM);
+        }
+        textMode = 0;
+        if (TakeClick(hovered)) {
+            if (!have) { snprintf(line, sizeof line, "Reach %d HP to unlock the %s", milestoneHp[acc], accessories[acc].name); ShowToast(line); }
+            else {
+                app.progress.equipped[accessories[acc].slot] = worn ? 0 : acc + 1;
+                SaveProgress();
+                cheer = 0.9f;
+                SpawnBurst(V2(230, 330), 18);
+                PlayFx(worn ? FX_BLIP : FX_UNLOCK);
+            }
+        }
+    }
+    if (DrawCandyButton((Rectangle){ panel.x + 14, panel.y + panel.height - 62, 230, 48 }, "TAKE EVERYTHING OFF", COLOR_ORANGE, true, 16)) {
+        for (int s = 0; s < SLOT_COUNT; s++) app.progress.equipped[s] = 0;
+        SaveProgress();
+        PlayFx(FX_BLIP);
+    }
+    textMode = 1;
+    TextDraw("New items unlock with every HP reward.", (int)panel.x + 262, (int)panel.y + (int)panel.height - 48, 15, COLOR_DIM);
+    textMode = 0;
 }
 
 // ---------------------------------------------------------------- questions
@@ -2863,7 +4458,7 @@ static void DrawFeedbackSheet(void) {
         if (app.revealed) goNext = DrawCandyButton((Rectangle){ 790, top + 126, 185, 58 }, "CONTINUE", COLOR_GREEN, true, 24);
         else if (DrawCandyButton((Rectangle){ 790, top + 126, 185, 58 }, "SHOW ANSWER", COLOR_CYAN, true, 20)) app.revealed = true;
     }
-    if (ready && IsKeyPressed(KEY_ENTER)) { if (correct || app.revealed) goNext = true; else tryAgain = true; }
+    if (ready && !app.nameModal && IsKeyPressed(KEY_ENTER)) { if (correct || app.revealed) goNext = true; else tryAgain = true; }
     if (tryAgain && ready) {
         app.sheetOpen = false;
         app.revealed = false;
@@ -2942,7 +4537,8 @@ static void ScreenQuestion(void) {
     float frameTime = GetFrameTime();
     app.qTime += frameTime;
     if (app.introTime > 0 && app.screenTime > 0.3f) app.introTime -= frameTime;
-    bool blocked = app.sheetOpen || app.confirmQuit || app.runCountdown > 0 || app.introTime > 0;
+    bool modalWas = app.nameModal != 0;
+    bool blocked = app.sheetOpen || app.confirmQuit || app.runCountdown > 0 || app.introTime > 0 || modalWas;
     uiLocked = blocked;
     DrawBackground(0.34f);
 
@@ -3079,6 +4675,10 @@ static void ScreenQuestion(void) {
         DrawTextO(number, 70 + MeasureText("LEVEL ", 30), 14, 30, COLOR_YELLOW, COLOR_INK);
     }
     DrawQuestionPips();
+    if (app.progress.crown) {   // the crown is on the line during this run
+        float bob = sinf((float)GetTime() * 4) * 2;
+        DrawCrownIcon(V2(428, 32 + bob), 0.85f, true);
+    }
     Rectangle quitButton = { 12, 8, 50, 44 };
     bool quit = DrawCandyButton(quitButton, "", COLOR_RED, true, 24);
     DrawXMark(quitButton);
@@ -3139,11 +4739,16 @@ static void ScreenQuestion(void) {
         }
     }
 
+    if (app.introTime <= 0 && !app.confirmQuit && app.runCountdown == 0) {   // SAVE works at any time, even while the feedback sheet is open
+        uiLocked = app.nameModal != 0;
+        if (DrawSaveButton((Rectangle){ 300, 8, 100, 44 })) SaveNow();
+    }
     if (app.sheetOpen) {
-        uiLocked = false;
+        uiLocked = app.nameModal != 0;
         DrawFeedbackSheet();
         if (app.sheetOpen) DrawBot(882, WINDOW_HEIGHT - 252 * Smooth(app.sheetTime / 0.25f) + 8, 1.15f, app.lastAnswerCorrect ? MOOD_CHEER : MOOD_SAD);
     }
+    DrawNameModal();
     if (app.introTime > 0) {
         uiLocked = false;
         if (app.introTime > 0.45f && (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) || IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_SPACE))) app.introTime = 0.45f;
@@ -3151,7 +4756,7 @@ static void ScreenQuestion(void) {
         return;
     }
     if (app.confirmQuit) { uiLocked = false; DrawQuitConfirm(); }
-    else if (IsKeyPressed(KEY_ESCAPE) && !app.sheetOpen && app.runCountdown == 0) app.confirmQuit = true;
+    else if (IsKeyPressed(KEY_ESCAPE) && !app.sheetOpen && app.runCountdown == 0 && !modalWas && !app.nameModal) app.confirmQuit = true;
 }
 
 
@@ -3202,11 +4807,19 @@ static void ScreenResults(void) {
         DrawTextCentered(number, (int)c.x, (int)c.y - 9, 20, COLOR_INK);
     }
     const char *message;
-    if (practice) message = pass ? "Nice! Those tricky ones are getting easier." : "Tricky ones take time. Check the report and go again!";
+    Color messageColor = COLOR_DIM;
+    if (app.crownEarnedNow) { message = "CROWN WON! Byte is wearing it. One mistake next time and it is gone!"; messageColor = COLOR_YELLOW; }
+    else if (app.crownLostNow) { message = "Crown lost... Byte is sad, but he will smile again. Win it back with a flawless run!"; messageColor = COLOR_RED; }
+    else if (practice) message = pass ? "Nice! Those tricky ones are getting easier." : "Tricky ones take time. Check the report and go again!";
     else if (app.levelGems == 3) message = "Perfect! Every sweet answer was right.";
     else if (pass) message = "Checkpoint saved. Replay for 3 stars any time!";
     else message = "You need at least half right for a star. Review and retry!";
-    WrapText(message, (int)card.x + 40, (int)card.y + 306, 420, 18, COLOR_DIM, true);
+    WrapText(message, (int)card.x + 40, (int)card.y + 306, 420, 18, messageColor, true);
+    if (!practice) {   // crown status next to the stars
+        float pop = app.crownEarnedNow ? 1.0f + 0.35f * sinf(Clampf((t - 0.6f) * 3, 0, 3.14f)) : 1.0f;
+        DrawCrownIcon(V2(card.x + card.width - 66, card.y + 126), 1.7f * pop, app.progress.crown != 0);
+        DrawTextCentered(app.progress.crown ? "CROWN" : "NO CROWN", (int)(card.x + card.width - 66), (int)card.y + 160, 13, app.progress.crown ? COLOR_YELLOW : COLOR_GRAY);
+    }
     if (app.fixedCount > 0) {
         snprintf(line, sizeof line, "You fixed %d mistake%s on a retry!", app.fixedCount, app.fixedCount == 1 ? "" : "s");
         DrawTextCentered(line, 500, (int)card.y + 352, 18, COLOR_CYAN);
@@ -3237,7 +4850,12 @@ static void ScreenResults(void) {
     }
     if (DrawCandyButton((Rectangle){ card.x + 335, by, 140, 54 }, "NEXT", COLOR_GREEN, nextReady, 22)) { app.autoOpenLevel = nextLevel; SetScreen(SCREEN_MAP); return; }
 
-    DrawBot(125, 572, 1.7f, pass ? MOOD_CHEER : MOOD_SAD);
+    static float prevCrownT;
+    if (app.crownEarnedNow && prevCrownT < 0.6f && t >= 0.6f) { SpawnBurst(V2(125, 400), 60); PlayFx(FX_FANFARE); }
+    prevCrownT = t;
+    BotMood resultMood = pass ? MOOD_CHEER : MOOD_SAD;
+    if (app.crownLostNow && t < 2.6f) resultMood = MOOD_SAD;   // sad for a moment, then smiles again
+    DrawBot(125, 572, 1.7f, resultMood);
     DrawLollipop(V2(880, 420), 34, COLOR_CYAN, COLOR_CREAM, -0.2f);
     DrawCupcake(V2(880, 612), 0.9f);
 }
@@ -3308,7 +4926,7 @@ static void DrawReviewOverview(Rectangle panel) {
     snprintf(text, sizeof text, "Answers given: %d", totalAttempts);        DrawText(text, (int)panel.x + 30, (int)panel.y + 214, 20, COLOR_TXT);
     snprintf(text, sizeof text, "Mistakes: %d", totalAttempts - totalCorrect); DrawText(text, (int)panel.x + 30, (int)panel.y + 238, 20, COLOR_TXT);
     snprintf(text, sizeof text, "Skipped: %d", totalSkipped);                DrawText(text, (int)panel.x + 30, (int)panel.y + 262, 20, COLOR_TXT);
-    snprintf(text, sizeof text, "Stars: %d / 27", stars);                    DrawText(text, (int)panel.x + 30, (int)panel.y + 286, 20, COLOR_TXT);
+    snprintf(text, sizeof text, "Stars: %d / %d", stars, LEVEL_COUNT * 3 * MODE_COUNT);                    DrawText(text, (int)panel.x + 30, (int)panel.y + 286, 20, COLOR_TXT);
 
     // robot's advice
     int worstLevel = -1, worstPercent = 101;
@@ -3327,8 +4945,16 @@ static void DrawReviewOverview(Rectangle panel) {
 
     // per level rows
     DrawTextCentered("YOUR LEVELS", (int)(panel.x + 640), (int)panel.y + 10, 22, COLOR_TXT);
+    Rectangle listView = { panel.x + 340, panel.y + 40, 590, panel.height - 52 };
+    float listTotal = LEVEL_COUNT * 72.0f + 6, listMax = listTotal - listView.height > 0 ? listTotal - listView.height : 0;
+    if (!blockAll && CheckCollisionPointRec(GetMousePosition(), listView)) app.reviewScroll -= GetMouseWheelMove() * 60;
+    app.reviewScroll = Clampf(app.reviewScroll, 0, listMax);
+    bool savedLock = uiLocked;
+    uiLocked = uiLocked || !CheckCollisionPointRec(GetMousePosition(), listView);
+    BeginScissorMode((int)listView.x, (int)listView.y, (int)listView.width, (int)listView.height);
     for (int l = 0; l < LEVEL_COUNT; l++) {
-        Rectangle row = { panel.x + 350, panel.y + 42 + l * 72.0f, 570, 62 };
+        Rectangle row = { panel.x + 350, panel.y + 42 + l * 72.0f - app.reviewScroll, 560, 62 };
+        if (row.y + row.height < listView.y || row.y > listView.y + listView.height) continue;
         DrawRoundOutlined(row, 18, 3, (Color){18, 16, 52, 255}, (Color){62, 56, 128, 255});
         int attempts, correct, weak;
         LevelReport(l, &attempts, &correct, &weak);
@@ -3357,7 +4983,13 @@ static void DrawReviewOverview(Rectangle panel) {
             DrawStarShape(sc, 11, 0, s < best ? COLOR_YELLOW : (Color){60, 64, 110, 255});
         }
         bool open = IsLevelUnlocked(app.mode, l);
-        if (DrawCandyButton((Rectangle){ row.x + 474, row.y + 9, 82, 50 }, open ? "PLAY" : "LOCK", COLOR_GREEN, open, 18)) StartLevel(l);
+        if (DrawCandyButton((Rectangle){ row.x + 464, row.y + 9, 82, 50 }, open ? "PLAY" : "LOCK", COLOR_GREEN, open, 18)) StartLevel(l);
+    }
+    EndScissorMode();
+    uiLocked = savedLock;
+    if (listMax > 0) {
+        float barH = listView.height * listView.height / listTotal;
+        DrawRound((Rectangle){ listView.x + listView.width - 2, listView.y + (listView.height - barH) * (app.reviewScroll / listMax), 5, barH }, 2, COLOR_CYAN);
     }
 }
 
@@ -3483,6 +5115,7 @@ static void InitApp(void) {
     for (int i = 0; i < SPARKLE_COUNT; i++) sparklePos[i] = V2((float)GetRandomValue(0, WINDOW_WIDTH), (float)GetRandomValue(0, WINDOW_HEIGHT));
     memset(&app, 0, sizeof app);
     app.selectedLevel = -1;
+    app.levelIndex = -1;
     app.pendingHop = app.hopFrom = app.hopTo = app.unlockLevel = app.autoOpenLevel = -1;
     LoadReadingFonts();
     LoadProfiles();
@@ -3494,6 +5127,13 @@ static void InitApp(void) {
 static void FrameUpdate(void) {
     float dt = GetFrameTime();
     app.screenTime += dt;
+    if (app.crownFall > 0) app.crownFall -= dt;
+    if (app.botSad > 0) app.botSad -= dt;
+    escSwallowed = false;
+    if (app.statsOpen && (IsKeyPressed)(KEY_ESCAPE)) { app.statsOpen = false; escSwallowed = true; }   // ESC closes the stats panel first
+    blockAll = app.statsOpen;
+    chipsDrawn = false;
+    buttonPlain = false;
     UpdateEffects(dt);
     UpdateAudio(dt, app.screen == SCREEN_QUESTION);
     clickConsumed = false;
@@ -3512,9 +5152,14 @@ static void FrameUpdate(void) {
         case SCREEN_QUESTION: ScreenQuestion(); break;
         case SCREEN_RESULTS:  ScreenResults();  break;
         case SCREEN_REVIEW:   ScreenReview();   break;
+        case SCREEN_WARDROBE: ScreenWardrobe(); break;
     }
+    buttonPlain = false;
+    if (app.screen == SCREEN_RESULTS && !chipsDrawn) DrawStatChips();   // screens without a header still get the HP / stars chips
     DrawEffects();
     DrawSoundToggle();
+    blockAll = false;
+    DrawStatsPanel();
     for (int y = 0; y < WINDOW_HEIGHT; y += 3) DrawRectangle(0, y, WINDOW_WIDTH, 1, Fade(BLACK, 0.07f));   // faint CRT scanlines
     if (app.screenTime < 0.55f) {   // "blinds" wipe between screens
         const int slats = 14;
